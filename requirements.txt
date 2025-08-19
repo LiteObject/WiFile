@@ -1,0 +1,12 @@
+# WiFile - File Transfer Tool
+# 
+# This project uses only Python standard library modules.
+# No external dependencies are required.
+#
+# Standard library modules used:
+# - socket (for network communication)
+# - argparse (for command-line argument parsing)
+# - os (for file and path operations)
+# - sys (for system-specific parameters and functions)
+#
+# Python version requirement: Python 3.x
