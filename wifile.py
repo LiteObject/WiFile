@@ -121,16 +121,18 @@ def start_server(port, filepath):
                     show_progress(sent_bytes, filesize, start_time)
                 except (socket.error, ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as e:
                     print(f"\nConnection lost during transfer: {e}")
-                    print(
-                        f"Transfer incomplete: {format_bytes(sent_bytes)} of {format_bytes(filesize)} sent")
+                    transfer_msg = (f"Transfer incomplete: {format_bytes(sent_bytes)} "
+                                    f"of {format_bytes(filesize)} sent")
+                    print(transfer_msg)
                     return
 
         print(f"File '{filename}' sent successfully.")
     except (socket.error, OSError, IOError) as e:
         if "10054" in str(e) or "forcibly closed" in str(e).lower():
             print(f"\nClient disconnected unexpectedly: {e}")
-            print(
-                "This usually means the client closed the connection or network was interrupted.")
+            disconnect_msg = ("This usually means the client closed the connection "
+                              "or network was interrupted.")
+            print(disconnect_msg)
         else:
             print(f"Server error: {e}")
     finally:
@@ -181,28 +183,32 @@ def start_client(host, port, output_dir):
                     data = client_socket.recv(1024)
                     if not data:
                         print("\nConnection closed by server. Transfer incomplete.")
-                        print(
-                            f"Received: {format_bytes(received)} of {format_bytes(filesize)}")
+                        received_msg = (f"Received: {format_bytes(received)} "
+                                        f"of {format_bytes(filesize)}")
+                        print(received_msg)
                         break
                     f.write(data)
                     received += len(data)
                     show_progress(received, filesize, start_time)
                 except (socket.error, ConnectionResetError, ConnectionAbortedError) as e:
                     print(f"\nConnection lost during transfer: {e}")
-                    print(
-                        f"Received: {format_bytes(received)} of {format_bytes(filesize)}")
+                    received_msg = (f"Received: {format_bytes(received)} "
+                                    f"of {format_bytes(filesize)}")
+                    print(received_msg)
                     break
 
         if received == filesize:
             print(f"File '{filename}' received and saved to '{output_path}'.")
         else:
-            print(
-                f"Transfer incomplete. File saved as '{output_path}' but may be corrupted.")
+            incomplete_msg = (f"Transfer incomplete. File saved as '{output_path}' "
+                              "but may be corrupted.")
+            print(incomplete_msg)
     except (socket.error, OSError, IOError, ValueError) as e:
         if "10054" in str(e) or "forcibly closed" in str(e).lower():
             print(f"Server disconnected unexpectedly: {e}")
-            print(
-                "This usually means the server closed the connection or network was interrupted.")
+            disconnect_msg = ("This usually means the server closed the connection "
+                              "or network was interrupted.")
+            print(disconnect_msg)
         else:
             print(f"Client error: {e}")
     finally:
