@@ -10,6 +10,46 @@ import socket
 import argparse
 import os
 import sys
+import time
+
+
+def format_bytes(bytes_value):
+    """Convert bytes to human readable format."""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if bytes_value < 1024.0:
+            return f"{bytes_value:.1f} {unit}"
+        bytes_value /= 1024.0
+    return f"{bytes_value:.1f} TB"
+
+
+def show_progress(current, total, start_time=None):
+    """Display a progress bar for file transfer."""
+    if total == 0:
+        return
+
+    percent = (current / total) * 100
+    bar_length = 50
+    filled_length = int(bar_length * current // total)
+    progress_bar = '█' * filled_length + '-' * (bar_length - filled_length)
+
+    current_formatted = format_bytes(current)
+    total_formatted = format_bytes(total)
+
+    progress_line = f'\r|{progress_bar}| {percent:.1f}% ({current_formatted}/{total_formatted})'
+
+    if start_time:
+        elapsed = time.time() - start_time
+        if elapsed > 0 and current > 0:
+            speed = current / elapsed
+            speed_formatted = format_bytes(speed)
+            eta_seconds = (total - current) / speed if speed > 0 else 0
+            eta_formatted = f"{int(eta_seconds)}s"
+            progress_line += f' - {speed_formatted}/s - ETA: {eta_formatted}'
+
+    print(progress_line, end='', flush=True)
+
+    if current >= total:
+        print()  # New line when complete
 
 
 def get_local_ip():
@@ -53,13 +93,20 @@ def start_server(port, filepath):
         filesize = os.path.getsize(filepath)
         conn.send(f"{filename}:{filesize}".encode())
 
-        # Send file content
+        # Send file content with progress bar
+        print(f"Sending '{filename}' ({format_bytes(filesize)})...")
+        sent_bytes = 0
+        start_time = time.time()
+
         with open(filepath, 'rb') as f:
             while True:
                 data = f.read(1024)  # Read in 1KB chunks
                 if not data:
                     break
                 conn.send(data)
+                sent_bytes += len(data)
+                show_progress(sent_bytes, filesize, start_time)
+
         print(f"File '{filename}' sent successfully.")
     except (socket.error, OSError, IOError) as e:
         print(f"Server error: {e}")
@@ -82,15 +129,20 @@ def start_client(host, port, output_dir):
         filesize = int(filesize)
         output_path = os.path.join(output_dir, filename)
 
-        # Receive file content
+        # Receive file content with progress bar
+        print(f"Receiving '{filename}' ({format_bytes(filesize)})...")
+        received = 0
+        start_time = time.time()
+
         with open(output_path, 'wb') as f:
-            received = 0
             while received < filesize:
                 data = client_socket.recv(1024)
                 if not data:
                     break
                 f.write(data)
                 received += len(data)
+                show_progress(received, filesize, start_time)
+
         print(f"File '{filename}' received and saved to '{output_path}'.")
     except (socket.error, OSError, IOError, ValueError) as e:
         print(f"Client error: {e}")
