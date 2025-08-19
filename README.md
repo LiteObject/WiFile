@@ -209,24 +209,6 @@ Look for the IP address under your WiFi adapter (usually starts with 192.168.x.x
 - Use `--auto-rename` to automatically rename conflicting files
 - Or respond to the interactive prompt with 'o', 'r', or 'c'
 
-## Recent Improvements
-
-### Version 2.0 Features
-- ✅ **Real-time progress bars** with speed and ETA information
-- ✅ **Automatic IP address detection and display** for easy client connection
-- ✅ **Smart file conflict handling** with interactive and automatic modes
-- ✅ **Robust error handling** for network interruptions and connection issues
-- ✅ **Improved protocol** with proper handshaking to prevent data corruption
-- ✅ **Connection timeouts** to prevent hanging on network issues
-- ✅ **Better error messages** with specific guidance for common problems
-- ✅ **Transfer resumption information** showing exactly how much data was transferred
-
-### Code Quality
-- 🔧 **10/10 pylint rating** - high code quality standards
-- 🧪 **Comprehensive error handling** for all network scenarios
-- 📚 **Detailed documentation** and examples
-- 🚀 **Performance optimized** with efficient chunked transfers
-
 ## Contributing
 
 Feel free to submit issues, fork the repository, and create pull requests for any improvements.
