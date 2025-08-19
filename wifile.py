@@ -86,12 +86,24 @@ def start_server(port, filepath):
     conn = None
     try:
         conn, addr = server_socket.accept()
+        conn.settimeout(30)  # 30 second timeout
         print(f"Connected by {addr}")
 
         # Send file name and size first
         filename = os.path.basename(filepath)
         filesize = os.path.getsize(filepath)
-        conn.send(f"{filename}:{filesize}".encode())
+        header = f"{filename}:{filesize}\n".encode()
+        conn.send(header)
+
+        # Wait for client acknowledgment
+        try:
+            ack = conn.recv(4)  # Expect "ACK"
+            if ack != b"ACK\n":
+                print("Client did not acknowledge header properly")
+                return
+        except socket.timeout:
+            print("Timeout waiting for client acknowledgment")
+            return
 
         # Send file content with progress bar
         print(f"Sending '{filename}' ({format_bytes(filesize)})...")
@@ -130,14 +142,32 @@ def start_server(port, filepath):
 def start_client(host, port, output_dir):
     """Run the client to receive a file from the server."""
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client_socket.settimeout(30)  # 30 second timeout
     try:
         client_socket.connect((host, port))
         print(f"Connected to server {host}:{port}")
 
         # Receive file name and size
-        data = client_socket.recv(1024).decode()
-        filename, filesize = data.split(':')
-        filesize = int(filesize)
+        header_data = b""
+        while True:
+            chunk = client_socket.recv(1)
+            if not chunk:
+                raise ConnectionError(
+                    "Connection closed while receiving header")
+            header_data += chunk
+            if header_data.endswith(b'\n'):
+                break
+
+        try:
+            header_str = header_data.decode('utf-8').strip()
+            filename, filesize = header_str.split(':')
+            filesize = int(filesize)
+        except (UnicodeDecodeError, ValueError) as e:
+            raise ValueError(f"Invalid header format: {e}") from e
+
+        # Send acknowledgment
+        client_socket.send(b"ACK\n")
+
         output_path = os.path.join(output_dir, filename)
 
         # Receive file content with progress bar
