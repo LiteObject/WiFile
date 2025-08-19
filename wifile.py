@@ -141,7 +141,7 @@ def start_server(port, filepath):
         server_socket.close()
 
 
-def start_client(host, port, output_dir):
+def start_client(host, port, output_dir, auto_overwrite=False, auto_rename=False):
     """Run the client to receive a file from the server."""
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     client_socket.settimeout(30)  # 30 second timeout
@@ -171,6 +171,51 @@ def start_client(host, port, output_dir):
         client_socket.send(b"ACK\n")
 
         output_path = os.path.join(output_dir, filename)
+
+        # Handle file conflicts
+        if os.path.exists(output_path):
+            if auto_overwrite:
+                print(f"Overwriting existing file '{filename}'...")
+            elif auto_rename:
+                base_name, ext = os.path.splitext(filename)
+                counter = 1
+                while True:
+                    new_filename = f"{base_name}_{counter}{ext}"
+                    new_output_path = os.path.join(output_dir, new_filename)
+                    if not os.path.exists(new_output_path):
+                        output_path = new_output_path
+                        filename = new_filename
+                        print(f"Saving as '{filename}' to avoid conflict...")
+                        break
+                    counter += 1
+            else:
+                print(
+                    f"Warning: File '{filename}' already exists in '{output_dir}'")
+                while True:
+                    choice = input(
+                        "Choose action: (o)verwrite, (r)ename, (c)ancel: ").lower().strip()
+                    if choice in ['o', 'overwrite']:
+                        print(f"Overwriting existing file '{filename}'...")
+                        break
+                    elif choice in ['r', 'rename']:
+                        base_name, ext = os.path.splitext(filename)
+                        counter = 1
+                        while True:
+                            new_filename = f"{base_name}_{counter}{ext}"
+                            new_output_path = os.path.join(
+                                output_dir, new_filename)
+                            if not os.path.exists(new_output_path):
+                                output_path = new_output_path
+                                filename = new_filename
+                                print(f"Saving as '{filename}' instead...")
+                                break
+                            counter += 1
+                        break
+                    elif choice in ['c', 'cancel']:
+                        print("Transfer cancelled by user.")
+                        return
+                    else:
+                        print("Invalid choice. Please enter 'o', 'r', or 'c'.")
 
         # Receive file content with progress bar
         print(f"Receiving '{filename}' ({format_bytes(filesize)})...")
@@ -228,6 +273,10 @@ def main():
     parser.add_argument('--host', help="Server IP address (client mode)")
     parser.add_argument('--output-dir', default=".",
                         help="Directory to save received file (client mode)")
+    parser.add_argument('--overwrite', action='store_true',
+                        help="Automatically overwrite existing files (client mode)")
+    parser.add_argument('--auto-rename', action='store_true',
+                        help="Automatically rename if file exists (client mode)")
 
     args = parser.parse_args()
 
@@ -240,7 +289,8 @@ def main():
         if not args.host:
             print("Error: --host is required in client mode.")
             sys.exit(1)
-        start_client(args.host, args.port, args.output_dir)
+        start_client(args.host, args.port, args.output_dir,
+                     args.overwrite, args.auto_rename)
 
 
 if __name__ == "__main__":
