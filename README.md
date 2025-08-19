@@ -4,16 +4,16 @@ A simple command-line tool for transferring files over a WiFi network using TCP 
 
 ## Features
 
-- 🚀 **Simple file transfer** - Send files directly between devices
-- 🌐 **Network-based** - Works over any TCP/IP network (WiFi, Ethernet, etc.)
-- 📁 **Any file type** - Transfer any file regardless of format or size
-- 🔧 **Command-line interface** - Easy to use from terminal/command prompt
-- 🛡️ **Lightweight** - Pure Python with no external dependencies
-- 📊 **Real-time progress bar** - Visual transfer progress with speed and ETA
-- 🆔 **Automatic IP display** - Server shows its IP address for easy connection
-- 🔄 **Smart file conflict handling** - Options to overwrite, rename, or cancel
-- ⚡ **Robust error handling** - Graceful handling of network interruptions
-- ⏱️ **Connection timeouts** - Prevents hanging on network issues
+- **Simple file transfer** - Send files directly between devices
+- **Network-based** - Works over any TCP/IP network (WiFi, Ethernet, etc.)
+- **Any file type** - Transfer any file regardless of format or size
+- **Command-line interface** - Easy to use from terminal/command prompt
+- **Lightweight** - Pure Python with no external dependencies
+- **Real-time progress bar** - Visual transfer progress with speed and ETA
+- **Automatic IP display** - Server shows its IP address for easy connection
+- **Smart file conflict handling** - Options to overwrite, rename, or cancel
+- **Robust error handling** - Graceful handling of network interruptions
+- **Connection timeouts** - Prevents hanging on network issues
 
 ## Requirements
 
