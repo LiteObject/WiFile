@@ -5,6 +5,7 @@ A simple command-line tool for transferring files over a WiFi network using TCP 
 ## Features
 
 - **Simple file transfer** - Send files directly between devices
+- **Folder transfer** - Send all files in a folder (including subfolders) one by one
 - **Network-based** - Works over any TCP/IP network (WiFi, Ethernet, etc.)
 - **Any file type** - Transfer any file regardless of format or size
 - **Command-line interface** - Easy to use from terminal/command prompt
@@ -38,12 +39,24 @@ Run this on the device that has the file you want to send:
 python wifile.py server --file /path/to/your/file.txt
 ```
 
+### Server Mode (Sending a folder)
+
+Send all files inside a folder (including subfolders) one by one over a single connection:
+
+```bash
+python wifile.py server --folder /path/to/your/folder
+```
+
+Files are transferred sequentially in a batch. The client receives each file
+and recreates the folder structure in its output directory.
+
 Optional parameters:
 - `--port`: Specify a custom port (default: 12345)
 
-Example:
+Examples:
 ```bash
 python wifile.py server --file document.pdf --port 8080
+python wifile.py server --folder ./photos --port 8080
 ```
 
 ### Client Mode (Receiving a file)
@@ -102,7 +115,8 @@ File 'myfile.zip' received and saved to './myfile.zip'.
 ### Server Mode
 | Option | Description | Required | Default |
 |--------|-------------|----------|---------|
-| `--file` | Path to the file to send | Yes | - |
+| `--file` | Path to the file to send | One of `--file`/`--folder` | - |
+| `--folder` | Path to the folder whose contents to send one by one (recurses into subfolders) | One of `--file`/`--folder` | - |
 | `--port` | Port number to listen on | No | 12345 |
 
 ### Client Mode
@@ -110,9 +124,14 @@ File 'myfile.zip' received and saved to './myfile.zip'.
 |--------|-------------|----------|---------|
 | `--host` | IP address of the server | Yes | - |
 | `--port` | Port number to connect to | No | 12345 |
-| `--output-dir` | Directory to save received file | No | Current directory |
+| `--output-dir` | Directory to save received file(s) | No | Current directory |
 | `--overwrite` | Automatically overwrite existing files | No | False |
 | `--auto-rename` | Automatically rename if file exists | No | False |
+
+## Folder Transfer (Batch Mode)
+
+When the server runs with `--folder`, it sends every file inside the folder
+(recursively) **one by one over a single connection**:
 
 ## How It Works
 
@@ -124,6 +143,12 @@ File 'myfile.zip' received and saved to './myfile.zip'.
 6. **Server** transmits the file content in 1KB chunks with real-time progress
 7. **Both sides** show progress bars with transfer speed and estimated time remaining
 8. **Client** receives and saves the file to the specified output directory
+
+For folder transfers, steps 4-8 repeat for each file in the folder. The server
+first announces how many files it will send (`WFILE_BATCH:<count>`), then sends
+each file sequentially, and finally signals completion (`WFILE_DONE`). Subfolder
+structure is preserved on the receiving side. No action is needed on the client
+- it automatically detects a batch transfer and keeps receiving until done.
 
 ## File Conflict Handling
 
