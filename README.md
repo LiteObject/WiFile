@@ -131,24 +131,32 @@ File 'myfile.zip' received and saved to './myfile.zip'.
 ## Folder Transfer (Batch Mode)
 
 When the server runs with `--folder`, it sends every file inside the folder
-(recursively) **one by one over a single connection**:
+(recursively) **one by one over a single connection**, using a framed wire
+protocol: each control message is `1-byte type + 4-byte length + payload`.
+The server announces the file count, then for every file it sends a header
+(name + size), the client resolves any name conflicts and signals it is
+ready, the server streams the file, and the client confirms the file was
+written before the next one starts. Subfolder structure is preserved on the
+receiving side. No action is needed on the client - it automatically detects
+a batch transfer and keeps receiving until done.
 
 ## How It Works
 
 1. **Server** starts listening on a specified port and waits for connections
 2. **Server** automatically displays its IP address for easy client connection
 3. **Client** connects to the server using the server's IP address and port
-4. **Server** sends the filename and file size with proper protocol handshaking
-5. **Client** acknowledges receipt and handles any file name conflicts
+4. **Server** sends a framed file header (name and size)
+5. **Client** resolves any file name conflicts, then acknowledges it is ready
 6. **Server** transmits the file content in 1KB chunks with real-time progress
 7. **Both sides** show progress bars with transfer speed and estimated time remaining
-8. **Client** receives and saves the file to the specified output directory
+8. **Client** receives and saves the file, then confirms completion to the server
 
 For folder transfers, steps 4-8 repeat for each file in the folder. The server
-first announces how many files it will send (`WFILE_BATCH:<count>`), then sends
-each file sequentially, and finally signals completion (`WFILE_DONE`). Subfolder
-structure is preserved on the receiving side. No action is needed on the client
-- it automatically detects a batch transfer and keeps receiving until done.
+first announces how many files it will send, then sends each file sequentially
+with a per-file completion confirmation, and finally signals the end of the
+batch. Subfolder structure is preserved on the receiving side. No action is
+needed on the client - it automatically detects a batch transfer and keeps
+receiving until done.
 
 ## File Conflict Handling
 
@@ -164,6 +172,9 @@ Saving as 'document_1.pdf' instead...
 ### Automatic Modes
 - **`--overwrite`**: Automatically replace existing files
 - **`--auto-rename`**: Automatically rename to avoid conflicts (file_1.ext, file_2.ext, etc.)
+
+> `--overwrite` and `--auto-rename` are mutually exclusive; passing both is an
+error. Likewise, `--file` and `--folder` cannot be combined on the server.
 
 ## Progress Bar Features
 
