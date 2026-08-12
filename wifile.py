@@ -6,18 +6,32 @@ on the same network using TCP sockets. It operates in two modes:
 - Server mode: sends a file (or all files in a folder) to connected clients
 - Client mode: receives a file or a batch of files from a server
 
-Folder transfers are sent over a single connection, one file at a time,
-using a batch protocol:
-    1. Server sends:  WFILE_BATCH:<count>\n
-    2. For each file: <relative_path>:<size>\n  ->  ACK\n  ->  file content
-    3. Server finishes with:  WFILE_DONE\n
+Wire protocol
+-------------
+All control messages use a framed format: a 1-byte kind, a 4-byte big-endian
+length, then that many payload bytes. File content is streamed raw after an
+ACK. A single-file transfer is:
+
+    1. Server sends:  KIND_FILE frame (name + NUL + 8-byte size)
+    2. Client resolves name conflicts, then sends a KIND_ACK frame
+    3. Server streams the file content
+    4. Client writes the file, then sends a KIND_RESULT frame
+       (b"\\x00" success / b"\\x01" failure)
+
+A batch transfer additionally starts with a KIND_BATCH frame carrying the
+file count and finishes with a KIND_DONE frame. If the client declines a
+file (for example the user cancels during conflict resolution), it sends a
+KIND_RESULT failure frame instead of a KIND_ACK and the server stops the
+batch.
 """
 
 from __future__ import annotations
 
-import socket
 import argparse
 import os
+import re
+import socket
+import struct
 import sys
 import time
 
@@ -29,6 +43,18 @@ def format_bytes(bytes_value: float) -> str:
             return f"{bytes_value:.1f} {unit}"
         bytes_value /= 1024.0
     return f"{bytes_value:.1f} TB"
+
+
+def _write_progress(line: str) -> None:
+    """Write a progress line, falling back to ASCII if stdout can't encode it."""
+    try:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        # Some redirected/piped stdout uses a legacy codepage (for example
+        # cp1252) that cannot represent the block character.
+        sys.stdout.write(line.replace("\u2588", "#"))
+        sys.stdout.flush()
 
 
 def show_progress(
@@ -59,7 +85,7 @@ def show_progress(
             eta_formatted = f"{int(eta_seconds)}s"
             progress_line += f" - {speed_formatted}/s - ETA: {eta_formatted}"
 
-    print(progress_line, end="", flush=True)
+    _write_progress(progress_line)
 
     if current >= total:
         print()  # New line when complete
@@ -77,6 +103,70 @@ def get_local_ip():
     except (socket.error, OSError):
         # Fallback to localhost if we can't determine the actual IP
         return "127.0.0.1"
+
+
+# --- Wire protocol ---------------------------------------------------------
+
+DEFAULT_PORT = 12345
+
+KIND_FILE = b"\x01"  # payload: name + NUL + 8-byte big-endian size
+KIND_ACK = b"\x02"  # payload: empty (client is ready for content)
+KIND_RESULT = b"\x03"  # payload: b"\x00" success / b"\x01" failure
+KIND_BATCH = b"\x04"  # payload: 4-byte big-endian file count
+KIND_DONE = b"\x05"  # payload: empty (batch finished)
+
+MAX_HEADER_PAYLOAD = 1 << 20  # 1 MiB cap for a file header (name + size)
+
+
+def recv_exact(sock: socket.socket, count: int) -> bytes:
+    """Read exactly ``count`` bytes, raising ConnectionError on early EOF."""
+    chunks: list[bytes] = []
+    remaining = count
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise ConnectionError("Connection closed while receiving data")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def send_frame(sock: socket.socket, kind: bytes, payload: bytes = b"") -> None:
+    """Send one framed control message (1-byte kind + 4-byte length + payload)."""
+    sock.sendall(kind + struct.pack(">I", len(payload)) + payload)
+
+
+def recv_frame(
+    sock: socket.socket, max_payload: int = MAX_HEADER_PAYLOAD
+) -> tuple[bytes, bytes]:
+    """Receive one framed control message, returning (kind, payload).
+
+    Raises ValueError if the declared payload exceeds ``max_payload`` and
+    ConnectionError if the peer closes before a full frame arrives.
+    """
+    header = recv_exact(sock, 5)
+    kind = header[:1]
+    length = struct.unpack(">I", header[1:5])[0]
+    if length > max_payload:
+        raise ValueError(f"Frame payload too large: {length} > {max_payload}")
+    return kind, recv_exact(sock, length)
+
+
+def sanitize_relative_path(path: str) -> str:
+    """Clean a remote filename so it stays inside the output directory.
+
+    Normalizes separators, strips drive/UNC prefixes and any leading
+    slashes, removes traversal components ('..', '.', ''), and falls back
+    to 'unnamed' when nothing remains. The result is always a plain
+    relative path, so joining it onto the output directory cannot escape.
+    """
+    if not path:
+        return "unnamed"
+    normalized = path.replace("\\", "/")
+    normalized = re.sub(r"^[A-Za-z]:", "", normalized)  # strip drive prefix
+    normalized = normalized.lstrip("/")
+    parts = [p for p in normalized.split("/") if p not in ("", ".", "..")]
+    return os.path.join(*parts) if parts else "unnamed"
 
 
 def collect_files(
@@ -103,19 +193,45 @@ def collect_files(
 
 
 def send_one_file(conn: socket.socket, display_name: str, filepath: str) -> bool:
-    """Send a single file over an open connection. Returns True on success."""
-    filesize = os.path.getsize(filepath)
-    header = f"{display_name}:{filesize}\n".encode()
-    conn.send(header)
+    """Send a single file over an open connection. Returns True on success.
 
-    # Wait for client acknowledgment
+    Sends a KIND_FILE header frame, waits for the client's decision
+    (KIND_ACK to proceed, KIND_RESULT to decline), streams the content with
+    ``sendall``, then waits for a KIND_RESULT completion frame so the sender
+    learns whether the receiver actually wrote the file.
+    """
     try:
-        ack = conn.recv(4)  # Expect "ACK\n"
-        if ack != b"ACK\n":
-            print("Client did not acknowledge header properly")
-            return False
-    except socket.timeout:
-        print("Timeout waiting for client acknowledgment")
+        filesize = os.path.getsize(filepath)
+    except OSError as e:
+        print(f"Error reading '{filepath}': {e}")
+        return False
+
+    header_payload = (
+        display_name.encode("utf-8") + b"\x00" + struct.pack(">Q", filesize)
+    )
+    try:
+        send_frame(conn, KIND_FILE, header_payload)
+    except (socket.error, OSError) as e:
+        print(f"Connection lost while sending header: {e}")
+        return False
+
+    # Wait for the client's decision. The client may be prompting the user,
+    # so do not impose the idle timeout while we wait.
+    old_timeout = conn.gettimeout()
+    conn.settimeout(None)
+    try:
+        kind, _ = recv_frame(conn)
+    except (socket.error, OSError, ValueError) as e:
+        print(f"Connection lost while waiting for acknowledgment: {e}")
+        return False
+    finally:
+        conn.settimeout(old_timeout)
+
+    if kind == KIND_RESULT:
+        print(f"Client declined '{display_name}'.")
+        return False
+    if kind != KIND_ACK:
+        print("Client did not acknowledge header properly.")
         return False
 
     # Send file content with progress bar
@@ -123,31 +239,39 @@ def send_one_file(conn: socket.socket, display_name: str, filepath: str) -> bool
     sent_bytes = 0
     start_time = time.time()
 
-    with open(filepath, "rb") as f:
-        while True:
-            data = f.read(1024)  # Read in 1KB chunks
-            if not data:
-                break
-            try:
-                conn.send(data)
+    try:
+        with open(filepath, "rb") as f:
+            while True:
+                data = f.read(1024)  # Read in 1KB chunks
+                if not data:
+                    break
+                conn.sendall(data)
                 sent_bytes += len(data)
                 show_progress(sent_bytes, filesize, start_time)
-            except (
-                socket.error,
-                ConnectionResetError,
-                ConnectionAbortedError,
-                BrokenPipeError,
-            ) as e:
-                print(f"\nConnection lost during transfer: {e}")
-                transfer_msg = (
-                    f"Transfer incomplete: {format_bytes(sent_bytes)} "
-                    f"of {format_bytes(filesize)} sent"
-                )
-                print(transfer_msg)
-                return False
+    except (socket.error, OSError) as e:
+        print(f"\nConnection lost during transfer: {e}")
+        transfer_msg = (
+            f"Transfer incomplete: {format_bytes(sent_bytes)} "
+            f"of {format_bytes(filesize)} sent"
+        )
+        print(transfer_msg)
+        return False
 
-    print(f"File '{display_name}' sent successfully.")
-    return True
+    # Wait for the client's completion result.
+    try:
+        kind, result = recv_frame(conn)
+    except (socket.error, OSError, ValueError) as e:
+        print(f"Connection lost while waiting for completion result: {e}")
+        return False
+
+    if kind == KIND_RESULT and result == b"\x00":
+        print(f"File '{display_name}' sent successfully.")
+        return True
+    if kind == KIND_RESULT:
+        print(f"Client reported a problem saving '{display_name}'.")
+        return False
+    print("Unexpected response from client after transfer.")
+    return False
 
 
 def prompt_next_target(
@@ -161,9 +285,7 @@ def prompt_next_target(
     try:
         while True:
             choice = (
-                input(
-                    "\nChoose next action: " "(s)end same, (n)ew file/folder, (e)xit: "
-                )
+                input("\nChoose next action: (s)end same, (n)ew file/folder, (e)xit: ")
                 .strip()
                 .lower()
             )
@@ -204,13 +326,23 @@ def start_server(
         print(f"Error: Folder '{folder}' does not exist.")
         sys.exit(1)
 
-    files = collect_files(filepath, folder)
+    if filepath:
+        files = collect_files(filepath=filepath)
+        batch_mode = False
+        source: str = filepath
+    elif folder:
+        files = collect_files(folder=folder)
+        batch_mode = True
+        source = folder
+    else:
+        # main() prompts for a source when neither option is given, so this
+        # branch should not be reachable from the CLI.
+        print("Error: No file or folder specified.")
+        sys.exit(1)
+
     if not files:
         print("Error: No files found to send.")
         sys.exit(1)
-
-    batch_mode = folder is not None
-    source = filepath if filepath else folder
 
     def print_ready() -> None:
         """Print what the server is about to send next."""
@@ -226,7 +358,11 @@ def start_server(
     local_ip = get_local_ip()
     print(f"Server listening on port {port}")
     print(f"Server IP address: {local_ip}")
-    print(f"Clients can connect using: python wifile.py client --host {local_ip}")
+    if port != DEFAULT_PORT:
+        client_cmd = f"python wifile.py client --host {local_ip} --port {port}"
+    else:
+        client_cmd = f"python wifile.py client --host {local_ip}"
+    print(f"Clients can connect using: {client_cmd}")
     print_ready()
     print("Waiting for connection...")
     print("Press Ctrl+C to stop the server.")
@@ -241,18 +377,18 @@ def start_server(
 
                 if batch_mode:
                     # Tell the client how many files to expect
-                    conn.send(f"WFILE_BATCH:{len(files)}\n".encode())
+                    send_frame(conn, KIND_BATCH, struct.pack(">I", len(files)))
                     for display_name, abs_path in files:
                         if not send_one_file(conn, display_name, abs_path):
-                            print("Transfer stopped due to a connection issue.")
+                            print("Transfer stopped.")
                             break
                     else:
-                        conn.send(b"WFILE_DONE\n")
+                        send_frame(conn, KIND_DONE)
                         print(f"All {len(files)} file(s) sent successfully.")
                 else:
                     display_name, abs_path = files[0]
                     send_one_file(conn, display_name, abs_path)
-            except (socket.error, OSError, IOError) as e:
+            except (socket.error, OSError, IOError, ValueError) as e:
                 if "10054" in str(e) or "forcibly closed" in str(e).lower():
                     print(f"\nClient disconnected unexpectedly: {e}")
                     disconnect_msg = (
@@ -265,43 +401,19 @@ def start_server(
             finally:
                 if conn is not None:
                     conn.close()
-                next_target = prompt_next_target(files, batch_mode, source)
-                if next_target is None:
-                    print("Server stopped by user.")
-                    return
-                files, batch_mode, source = next_target
-                print_ready()
-                print("Waiting for next connection... (Ctrl+C to stop)")
+
+            # After each round, ask the operator what to serve next.
+            next_target = prompt_next_target(files, batch_mode, source)
+            if next_target is None:
+                print("Server stopped by user.")
+                break
+            files, batch_mode, source = next_target
+            print_ready()
+            print("Waiting for next connection... (Ctrl+C to stop)")
     except KeyboardInterrupt:
         print("\nServer stopped by user.")
     finally:
         server_socket.close()
-
-
-def receive_header(client_socket: socket.socket) -> str:
-    """Read a single header line (terminated by '\n') from the socket."""
-    header_data = b""
-    while True:
-        chunk = client_socket.recv(1)
-        if not chunk:
-            raise ConnectionError("Connection closed while receiving header")
-        header_data += chunk
-        if header_data.endswith(b"\n"):
-            break
-    return header_data.decode("utf-8").strip()
-
-
-def drain_bytes(client_socket: socket.socket, count: int) -> None:
-    """Read and discard bytes from the socket (used to stay in sync)."""
-    received = 0
-    while received < count:
-        try:
-            data = client_socket.recv(min(1024, count - received))
-            if not data:
-                break
-            received += len(data)
-        except socket.timeout:
-            break
 
 
 def receive_one_file(
@@ -309,25 +421,28 @@ def receive_one_file(
     output_dir: str,
     auto_overwrite: bool,
     auto_rename: bool,
-    header_str: str,
+    header_payload: bytes,
 ) -> str:
-    """Receive one file given its already-read header line.
+    """Receive one file given its already-read KIND_FILE header payload.
+
+    The header payload is ``name + b"\\x00" + 8-byte big-endian size``. The
+    client resolves any name conflict first, then acknowledges, streams the
+    content into a temporary file, and atomically replaces the destination
+    only after the full transfer and close succeed.
 
     Returns:
-        "file"      - a file was received (fully or partially)
+        "file"      - handled (success or failure is reported over the wire)
         "cancelled" - the user chose to cancel this transfer
     """
     try:
-        filename, filesize = header_str.split(":")
-        filesize = int(filesize)
-    except (UnicodeDecodeError, ValueError) as e:
-        raise ValueError(f"Invalid header format: {e}") from e
+        name_bytes, size_bytes = header_payload.split(b"\x00", 1)
+        filename = name_bytes.decode("utf-8")
+        filesize = struct.unpack(">Q", size_bytes)[0]
+    except (ValueError, UnicodeDecodeError, struct.error) as e:
+        raise ValueError(f"Invalid header payload: {e}") from e
 
-    # Sanitize the relative path to prevent path traversal
-    normalized = filename.replace("\\", "/")
-    parts = [p for p in normalized.split("/") if p not in ("", ".", "..")]
-    safe_name = os.path.join(*parts) if parts else "unnamed"
-    if safe_name != normalized:
+    safe_name = sanitize_relative_path(filename)
+    if safe_name != filename:
         print(f"Warning: Path sanitized from '{filename}' to '{safe_name}'")
 
     output_path = os.path.join(output_dir, safe_name)
@@ -335,10 +450,8 @@ def receive_one_file(
     if output_parent:
         os.makedirs(output_parent, exist_ok=True)
 
-    # Send acknowledgment
-    client_socket.send(b"ACK\n")
-
-    # Handle file conflicts
+    # Resolve name conflicts BEFORE acknowledging, so the server never
+    # starts streaming while the user is still deciding.
     if os.path.exists(output_path):
         if auto_overwrite:
             print(f"Overwriting existing file '{safe_name}'...")
@@ -380,51 +493,58 @@ def receive_one_file(
                     break
                 elif choice in ["c", "cancel"]:
                     print("Transfer cancelled by user.")
-                    drain_bytes(client_socket, filesize)
+                    # Tell the server to stop; it will not stream content.
+                    try:
+                        send_frame(client_socket, KIND_RESULT, b"\x01")
+                    except (socket.error, OSError):
+                        pass
                     return "cancelled"
                 else:
                     print("Invalid choice. Please enter 'o', 'r', or 'c'.")
 
-    # Receive file content with progress bar
+    # The decision is made: acknowledge and start streaming.
+    send_frame(client_socket, KIND_ACK)
+
+    # Receive into a temporary file, then atomically replace the destination
+    # only after the full transfer and clean close succeed.
     print(f"Receiving '{safe_name}' ({format_bytes(filesize)})...")
     received = 0
     start_time = time.time()
-
-    with open(output_path, "wb") as f:
-        while received < filesize:
-            try:
+    temp_path = f"{output_path}.wifile-part"
+    success = False
+    try:
+        with open(temp_path, "wb") as f:
+            while received < filesize:
                 # Only request the remaining bytes so we never consume the
-                # next file's header (or WFILE_DONE) that may follow.
-                data = client_socket.recv(min(1024, filesize - received))
-                if not data:
-                    print("\nConnection closed by server. Transfer incomplete.")
-                    received_msg = (
-                        f"Received: {format_bytes(received)} "
-                        f"of {format_bytes(filesize)}"
-                    )
-                    print(received_msg)
-                    break
-                f.write(data)
-                received += len(data)
+                # next frame (header or KIND_DONE) that may follow.
+                chunk = recv_exact(client_socket, min(1024, filesize - received))
+                f.write(chunk)
+                received += len(chunk)
                 show_progress(received, filesize, start_time)
-            except (socket.error, ConnectionResetError, ConnectionAbortedError) as e:
-                print(f"\nConnection lost during transfer: {e}")
-                received_msg = (
-                    f"Received: {format_bytes(received)} "
-                    f"of {format_bytes(filesize)}"
-                )
-                print(received_msg)
-                break
+        # The whole file arrived and the temp file closed cleanly.
+        if received == filesize:
+            os.replace(temp_path, output_path)
+            success = True
+    except (socket.error, OSError, ConnectionError) as e:
+        print(f"\nError while receiving '{safe_name}': {e}")
+        received_msg = f"Received: {format_bytes(received)} of {format_bytes(filesize)}"
+        print(received_msg)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
-    if received == filesize:
+    try:
+        send_frame(client_socket, KIND_RESULT, b"\x00" if success else b"\x01")
+    except (socket.error, OSError):
+        pass
+
+    if success:
         print(f"File '{safe_name}' received and saved to '{output_path}'.")
     else:
-        incomplete_msg = (
-            f"Transfer incomplete. File saved as '{output_path}' "
-            "but may be corrupted."
-        )
-        print(incomplete_msg)
-
+        print(f"Transfer incomplete. File '{output_path}' was not saved.")
     return "file"
 
 
@@ -454,7 +574,11 @@ def prompt_next_output(output_dir: str) -> str | None:
                 if not new_dir:
                     print("Invalid: directory path cannot be empty.")
                     continue
-                os.makedirs(new_dir, exist_ok=True)
+                try:
+                    os.makedirs(new_dir, exist_ok=True)
+                except OSError as e:
+                    print(f"Error: cannot use '{new_dir}': {e}")
+                    continue
                 print(f"Saving to '{new_dir}'.")
                 return new_dir
             print("Invalid choice. Enter 'c', 'n', or 'e'.")
@@ -475,36 +599,38 @@ def start_client(
     whether to keep saving to the current output location, switch to a new
     output location, or exit. Press Ctrl+C to stop.
     """
-    client_socket = None
     try:
         while True:
             client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            client_socket.settimeout(30)  # 30 second timeout
             try:
+                client_socket.settimeout(30)  # 30 second timeout
                 client_socket.connect((host, port))
                 print(f"Connected to server {host}:{port}")
 
-                first_header = receive_header(client_socket)
+                first_kind, first_payload = recv_frame(client_socket)
 
-                if first_header.startswith("WFILE_BATCH:"):
-                    # Batch transfer: receive files one by one until WFILE_DONE
+                if first_kind == KIND_BATCH:
+                    # Batch transfer: receive files one by one until KIND_DONE
                     try:
-                        total = int(first_header.split(":", 1)[1])
-                    except ValueError:
+                        total = struct.unpack(">I", first_payload)[0]
+                    except struct.error:
                         total = 0
                     print(f"Receiving batch of {total} file(s)...")
                     received_count = 0
                     cancelled = False
                     while True:
-                        header_str = receive_header(client_socket)
-                        if header_str == "WFILE_DONE":
+                        kind, header_payload = recv_frame(client_socket)
+                        if kind == KIND_DONE:
+                            break
+                        if kind != KIND_FILE:
+                            print(f"Unexpected message from server: {kind!r}")
                             break
                         result = receive_one_file(
                             client_socket,
                             output_dir,
                             auto_overwrite,
                             auto_rename,
-                            header_str,
+                            header_payload,
                         )
                         if result == "cancelled":
                             cancelled = True
@@ -524,7 +650,7 @@ def start_client(
                         output_dir,
                         auto_overwrite,
                         auto_rename,
-                        first_header,
+                        first_payload,
                     )
                     if result == "cancelled":
                         print("Transfer cancelled.")
@@ -539,9 +665,7 @@ def start_client(
                 else:
                     print(f"Client error: {e}")
             finally:
-                if client_socket is not None:
-                    client_socket.close()
-                    client_socket = None
+                client_socket.close()
 
             # After each round, ask the operator what to do next
             next_output = prompt_next_output(output_dir)
@@ -552,9 +676,6 @@ def start_client(
             print("Waiting for the next transfer... (Ctrl+C to stop)")
     except KeyboardInterrupt:
         print("\nClient stopped by user.")
-    finally:
-        if client_socket is not None:
-            client_socket.close()
 
 
 def prompt_for_source() -> tuple[str | None, str | None]:
@@ -581,10 +702,14 @@ def main():
         "mode", choices=["server", "client"], help="Run as server or client"
     )
     parser.add_argument(
-        "--port", type=int, default=12345, help="Port to use (default: 12345)"
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"Port to use (default: {DEFAULT_PORT})",
     )
-    parser.add_argument("--file", help="Path to the file to send (server mode)")
-    parser.add_argument(
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument("--file", help="Path to the file to send (server mode)")
+    source_group.add_argument(
         "--folder",
         help="Path to the folder whose contents to send one by one (server mode)",
     )
@@ -594,12 +719,13 @@ def main():
         default=".",
         help="Directory to save received file(s) (client mode)",
     )
-    parser.add_argument(
+    conflict_group = parser.add_mutually_exclusive_group()
+    conflict_group.add_argument(
         "--overwrite",
         action="store_true",
         help="Automatically overwrite existing files (client mode)",
     )
-    parser.add_argument(
+    conflict_group.add_argument(
         "--auto-rename",
         action="store_true",
         help="Automatically rename if file exists (client mode)",

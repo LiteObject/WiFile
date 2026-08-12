@@ -11,6 +11,7 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -324,6 +325,278 @@ class SanitizePathTest(unittest.TestCase):
             wifile.sanitize_relative_path("C:\\outside.txt"), "outside.txt"
         )
         self.assertEqual(wifile.sanitize_relative_path("C:"), "unnamed")
+
+    @unittest.skipUnless(os.name == "nt", "Windows UNC handling")
+    def test_unc_prefix_is_confined(self):
+        """A UNC path must be relativized so it cannot escape output_dir."""
+        result = wifile.sanitize_relative_path("\\\\server\\share\\evil.txt")
+        self.assertEqual(result, os.path.join("server", "share", "evil.txt"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows drive handling")
+    def test_drive_relative_name_is_confined(self):
+        """A drive-relative name like C:foo must not escape output_dir."""
+        self.assertEqual(wifile.sanitize_relative_path("C:foo.txt"), "foo.txt")
+
+
+class PromptNextTargetTest(unittest.TestCase):
+    """Persistent server: choosing the same target, switching, or quitting."""
+
+    def test_same_target_returns_current(self):
+        files = [("a.txt", "/abs/a.txt")]
+        with mock.patch("builtins.input", return_value="s"):
+            result = wifile.prompt_next_target(files, False, "/abs/a.txt")
+        self.assertEqual(result, (files, False, "/abs/a.txt"))
+
+    def test_exit_returns_none(self):
+        with mock.patch("builtins.input", return_value="e"):
+            result = wifile.prompt_next_target([("a.txt", "/a")], False, "/a")
+        self.assertIsNone(result)
+
+    def test_switch_to_new_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "new.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("x")
+            with mock.patch("builtins.input", side_effect=["n", path]):
+                files, batch_mode, source = wifile.prompt_next_target(
+                    [("a.txt", "/a")], False, "/a"
+                )
+            self.assertFalse(batch_mode)
+            self.assertEqual(source, path)
+            self.assertEqual(files, [(os.path.basename(path), path)])
+
+    def test_switch_to_new_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sub = os.path.join(tmp, "sub")
+            os.makedirs(sub)
+            fpath = os.path.join(sub, "f.txt")
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write("x")
+            with mock.patch("builtins.input", side_effect=["n", sub]):
+                files, batch_mode, source = wifile.prompt_next_target(
+                    [("a.txt", "/a")], False, "/a"
+                )
+            self.assertTrue(batch_mode)
+            self.assertEqual(source, sub)
+            self.assertEqual(files, [("f.txt", fpath)])
+
+    def test_invalid_path_repeats_prompt(self):
+        """A missing path must not crash; the prompt loops until a valid input."""
+        with mock.patch("builtins.input", side_effect=["n", "/nonexistent/xyz", "e"]):
+            result = wifile.prompt_next_target([("a.txt", "/a")], False, "/a")
+        self.assertIsNone(result)
+
+    def test_invalid_choice_repeats_prompt(self):
+        with mock.patch("builtins.input", side_effect=["x", "e"]):
+            result = wifile.prompt_next_target([("a.txt", "/a")], False, "/a")
+        self.assertIsNone(result)
+
+    def test_eof_returns_none(self):
+        """EOF (Ctrl+D) must end the persistent server cleanly."""
+        with mock.patch("builtins.input", side_effect=EOFError):
+            result = wifile.prompt_next_target([("a.txt", "/a")], False, "/a")
+        self.assertIsNone(result)
+
+
+class PromptNextOutputTest(unittest.TestCase):
+    """Persistent client: keeping, switching, or quitting the output dir."""
+
+    def test_continue_returns_same_dir(self):
+        with mock.patch("builtins.input", return_value="c"):
+            result = wifile.prompt_next_output("/tmp/out")
+        self.assertEqual(result, "/tmp/out")
+
+    def test_exit_returns_none(self):
+        with mock.patch("builtins.input", return_value="e"):
+            result = wifile.prompt_next_output("/tmp/out")
+        self.assertIsNone(result)
+
+    def test_new_dir_is_created_and_returned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            new_dir = os.path.join(tmp, "newout")
+            with mock.patch("builtins.input", side_effect=["n", new_dir]):
+                result = wifile.prompt_next_output(tmp)
+            self.assertEqual(result, new_dir)
+            self.assertTrue(os.path.isdir(new_dir))
+
+    def test_invalid_dir_path_does_not_crash(self):
+        """A path that names an existing file must not raise FileExistsError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            file_path = os.path.join(tmp, "afile")
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write("x")
+            with mock.patch("builtins.input", side_effect=["n", file_path, "e"]):
+                result = wifile.prompt_next_output(tmp)
+            self.assertIsNone(result)
+
+    def test_eof_returns_none(self):
+        with mock.patch("builtins.input", side_effect=EOFError):
+            result = wifile.prompt_next_output("/tmp/out")
+        self.assertIsNone(result)
+
+
+class BatchProtocolTest(unittest.TestCase):
+    """The framed batch flow: KIND_BATCH -> per-file handshake -> KIND_DONE."""
+
+    def test_batch_transfers_multiple_files_with_subfolders(self):
+        left, right = socket.socketpair()
+        with tempfile.TemporaryDirectory() as tmp:
+            sources: dict[str, str] = {}
+            data_by_name: dict[str, bytes] = {}
+            for name in ("a.txt", "sub/b.bin"):
+                abs_path = os.path.join(tmp, name)
+                os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+                data = os.urandom(100)
+                with open(abs_path, "wb") as f:
+                    f.write(data)
+                sources[name] = abs_path
+                data_by_name[name] = data
+
+            errors: list[str] = []
+
+            def server():
+                try:
+                    wifile.send_frame(
+                        left, wifile.KIND_BATCH, struct.pack(">I", len(sources))
+                    )
+                    for name, abs_path in sources.items():
+                        if not wifile.send_one_file(left, name, abs_path):
+                            errors.append(f"send_one_file failed for {name}")
+                            return
+                    wifile.send_frame(left, wifile.KIND_DONE)
+                except (OSError, ValueError) as e:  # pragma: no cover
+                    errors.append(repr(e))
+
+            t = threading.Thread(target=server)
+            t.start()
+
+            out = os.path.join(tmp, "out")
+            kind, payload = wifile.recv_frame(right)
+            self.assertEqual(kind, wifile.KIND_BATCH)
+            self.assertEqual(struct.unpack(">I", payload)[0], 2)
+            for name in ("a.txt", "sub/b.bin"):
+                kind, header = wifile.recv_frame(right)
+                self.assertEqual(kind, wifile.KIND_FILE)
+                result = wifile.receive_one_file(right, out, True, False, header)
+                self.assertEqual(result, "file")
+            kind, _ = wifile.recv_frame(right)
+            self.assertEqual(kind, wifile.KIND_DONE)
+            t.join()
+
+            self.assertEqual(errors, [])
+            for name, data in data_by_name.items():
+                with open(os.path.join(out, name), "rb") as f:
+                    self.assertEqual(f.read(), data)
+        left.close()
+        right.close()
+
+    def test_cancel_mid_batch_stops_sender(self):
+        """A decline during the second file must stop the whole batch."""
+        left, right = socket.socketpair()
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("one.txt", "two.txt"):
+                with open(os.path.join(tmp, name), "w", encoding="utf-8") as f:
+                    f.write("data")
+            out = os.path.join(tmp, "out")
+            os.makedirs(out)
+            with open(os.path.join(out, "two.txt"), "w", encoding="utf-8") as f:
+                f.write("existing")
+
+            errors: list[str] = []
+
+            def server():
+                try:
+                    wifile.send_frame(left, wifile.KIND_BATCH, struct.pack(">I", 2))
+                    wifile.send_one_file(left, "one.txt", os.path.join(tmp, "one.txt"))
+                    wifile.send_one_file(left, "two.txt", os.path.join(tmp, "two.txt"))
+                except (OSError, ValueError) as e:  # pragma: no cover
+                    errors.append(repr(e))
+                finally:
+                    left.close()
+
+            t = threading.Thread(target=server)
+            t.start()
+
+            kind, payload = wifile.recv_frame(right)
+            self.assertEqual(kind, wifile.KIND_BATCH)
+            self.assertEqual(struct.unpack(">I", payload)[0], 2)
+
+            # First file transfers normally.
+            kind, header = wifile.recv_frame(right)
+            self.assertEqual(kind, wifile.KIND_FILE)
+            result = wifile.receive_one_file(right, out, True, False, header)
+            self.assertEqual(result, "file")
+
+            # Second file already exists and the user cancels at the prompt.
+            kind, header = wifile.recv_frame(right)
+            self.assertEqual(kind, wifile.KIND_FILE)
+            with mock.patch("builtins.input", return_value="c"):
+                result = wifile.receive_one_file(right, out, False, False, header)
+            self.assertEqual(result, "cancelled")
+
+            t.join()
+            self.assertEqual(errors, [])
+            # The server stopped: no KIND_DONE, and it closed the connection.
+            self.assertEqual(right.recv(1), b"")
+            with open(os.path.join(out, "one.txt"), "rb") as f:
+                self.assertEqual(f.read(), b"data")
+            with open(os.path.join(out, "two.txt"), "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), "existing")
+        left.close()
+        right.close()
+
+
+class ServerMessageTest(unittest.TestCase):
+    def test_custom_port_included_in_client_command(self):
+        """A server on a custom port must tell clients to pass --port."""
+        import io
+        from contextlib import redirect_stdout
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fpath = os.path.join(tmp, "f.txt")
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write("hello")
+
+            probe = socket.socket()
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+            probe.close()
+
+            def client():
+                c = socket.socket()
+                c.settimeout(5)
+                c.connect(("127.0.0.1", port))
+                kind, header = wifile.recv_frame(c)
+                self.assertEqual(kind, wifile.KIND_FILE)
+                wifile.send_frame(c, wifile.KIND_ACK)
+                _, size_bytes = header.split(b"\x00", 1)
+                size = struct.unpack(">Q", size_bytes)[0]
+                remaining = size
+                while remaining > 0:
+                    chunk = c.recv(min(1024, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                wifile.send_frame(c, wifile.KIND_RESULT, b"\x00")
+                c.close()
+
+            buf = io.StringIO()
+            with mock.patch(
+                "wifile.get_local_ip", return_value="192.168.1.50"
+            ), mock.patch("builtins.input", return_value="e"), redirect_stdout(buf):
+                # Run the server in a thread so the client can connect after
+                # the listener is up (avoids a bind/connect race).
+                server_thread = threading.Thread(
+                    target=lambda: wifile.start_server(port, filepath=fpath)
+                )
+                server_thread.start()
+                time.sleep(0.2)
+                client()
+                server_thread.join()
+
+            output = buf.getvalue()
+            self.assertIn("--port", output)
+            self.assertIn(str(port), output)
 
 
 if __name__ == "__main__":
