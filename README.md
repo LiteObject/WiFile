@@ -16,6 +16,7 @@ A simple command-line tool for transferring files over a WiFi network using TCP 
 - **Robust error handling** - Graceful handling of network interruptions
 - **Connection timeouts** - Prevents hanging on network issues
 - **Persistent server** - Keeps serving transfers; resend the same file/folder or switch to a new one after each transfer
+- **Persistent client** - Keeps waiting after each download; keep the same output folder or switch to a new one
 
 ## Requirements
 
@@ -91,6 +92,14 @@ python wifile.py client --host 192.168.1.100 --port 8080 --output-dir ./download
 python wifile.py client --host 192.168.1.100 --overwrite
 python wifile.py client --host 192.168.1.100 --auto-rename
 ```
+
+> **Persistent client**: the client does **not** exit after a download. After
+> each batch it prompts for what to do next:
+> - `c` - continue saving to the current output location
+> - `n` - set a new output location for the next batch
+> - `e` - exit the client
+>
+> Press `Ctrl+C` in the client terminal to stop at any time.
 
 ## Complete Example
 
@@ -173,6 +182,9 @@ receiving until done.
 After a client disconnects (transfer finished or aborted), the server asks
 whether to send the same file(s)/folder again, switch to a new file or folder,
 or quit. Run it in its own terminal and press `Ctrl+C` to stop it.
+
+The client stays running too: after each download it asks whether to keep the
+current output location, switch to a new one, or exit.
 
 ## File Conflict Handling
 

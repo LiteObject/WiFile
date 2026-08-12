@@ -428,6 +428,40 @@ def receive_one_file(
     return "file"
 
 
+def prompt_next_output(output_dir: str) -> str | None:
+    """Ask the client operator what to do after a download.
+
+    Returns the output directory for the next round, or None to exit the
+    client.
+    """
+    try:
+        while True:
+            choice = (
+                input(
+                    "\nChoose next action: "
+                    "(c)ontinue in current location, "
+                    "(n)ew output location, (e)xit: "
+                )
+                .strip()
+                .lower()
+            )
+            if choice in ("c", "continue", "same"):
+                return output_dir
+            if choice in ("e", "exit", "q", "quit"):
+                return None
+            if choice in ("n", "new"):
+                new_dir = input("Enter new output directory: ").strip().strip('"')
+                if not new_dir:
+                    print("Invalid: directory path cannot be empty.")
+                    continue
+                os.makedirs(new_dir, exist_ok=True)
+                print(f"Saving to '{new_dir}'.")
+                return new_dir
+            print("Invalid choice. Enter 'c', 'n', or 'e'.")
+    except EOFError:
+        return None
+
+
 def start_client(
     host: str,
     port: int,
@@ -435,54 +469,92 @@ def start_client(
     auto_overwrite: bool = False,
     auto_rename: bool = False,
 ) -> None:
-    """Run the client to receive a file or a batch of files from the server."""
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.settimeout(30)  # 30 second timeout
+    """Run the client to receive a file or a batch of files from the server.
+
+    The client keeps running after each download. After every batch it asks
+    whether to keep saving to the current output location, switch to a new
+    output location, or exit. Press Ctrl+C to stop.
+    """
+    client_socket = None
     try:
-        client_socket.connect((host, port))
-        print(f"Connected to server {host}:{port}")
-
-        first_header = receive_header(client_socket)
-
-        if first_header.startswith("WFILE_BATCH:"):
-            # Batch transfer: receive files one by one until WFILE_DONE
+        while True:
+            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_socket.settimeout(30)  # 30 second timeout
             try:
-                total = int(first_header.split(":", 1)[1])
-            except ValueError:
-                total = 0
-            print(f"Receiving batch of {total} file(s)...")
-            received_count = 0
-            while True:
-                header_str = receive_header(client_socket)
-                if header_str == "WFILE_DONE":
-                    break
-                result = receive_one_file(
-                    client_socket, output_dir, auto_overwrite, auto_rename, header_str
-                )
-                if result == "cancelled":
-                    print("Batch transfer cancelled.")
-                    return
-                received_count += 1
-            print(f"Batch complete: {received_count} of {total} file(s) received.")
-        else:
-            # Single file transfer
-            result = receive_one_file(
-                client_socket, output_dir, auto_overwrite, auto_rename, first_header
-            )
-            if result == "cancelled":
-                print("Transfer cancelled.")
-    except (socket.error, OSError, IOError, ValueError) as e:
-        if "10054" in str(e) or "forcibly closed" in str(e).lower():
-            print(f"Server disconnected unexpectedly: {e}")
-            disconnect_msg = (
-                "This usually means the server closed the connection "
-                "or network was interrupted."
-            )
-            print(disconnect_msg)
-        else:
-            print(f"Client error: {e}")
+                client_socket.connect((host, port))
+                print(f"Connected to server {host}:{port}")
+
+                first_header = receive_header(client_socket)
+
+                if first_header.startswith("WFILE_BATCH:"):
+                    # Batch transfer: receive files one by one until WFILE_DONE
+                    try:
+                        total = int(first_header.split(":", 1)[1])
+                    except ValueError:
+                        total = 0
+                    print(f"Receiving batch of {total} file(s)...")
+                    received_count = 0
+                    cancelled = False
+                    while True:
+                        header_str = receive_header(client_socket)
+                        if header_str == "WFILE_DONE":
+                            break
+                        result = receive_one_file(
+                            client_socket,
+                            output_dir,
+                            auto_overwrite,
+                            auto_rename,
+                            header_str,
+                        )
+                        if result == "cancelled":
+                            cancelled = True
+                            break
+                        received_count += 1
+                    if cancelled:
+                        print("Batch transfer cancelled.")
+                    else:
+                        print(
+                            f"Batch complete: {received_count} of {total} "
+                            "file(s) received."
+                        )
+                else:
+                    # Single file transfer
+                    result = receive_one_file(
+                        client_socket,
+                        output_dir,
+                        auto_overwrite,
+                        auto_rename,
+                        first_header,
+                    )
+                    if result == "cancelled":
+                        print("Transfer cancelled.")
+            except (socket.error, OSError, IOError, ValueError) as e:
+                if "10054" in str(e) or "forcibly closed" in str(e).lower():
+                    print(f"Server disconnected unexpectedly: {e}")
+                    disconnect_msg = (
+                        "This usually means the server closed the connection "
+                        "or network was interrupted."
+                    )
+                    print(disconnect_msg)
+                else:
+                    print(f"Client error: {e}")
+            finally:
+                if client_socket is not None:
+                    client_socket.close()
+                    client_socket = None
+
+            # After each round, ask the operator what to do next
+            next_output = prompt_next_output(output_dir)
+            if next_output is None:
+                print("Client stopped by user.")
+                break
+            output_dir = next_output
+            print("Waiting for the next transfer... (Ctrl+C to stop)")
+    except KeyboardInterrupt:
+        print("\nClient stopped by user.")
     finally:
-        client_socket.close()
+        if client_socket is not None:
+            client_socket.close()
 
 
 def prompt_for_source() -> tuple[str | None, str | None]:
