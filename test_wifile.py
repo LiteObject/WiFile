@@ -5,12 +5,14 @@ raised in review: partial reads/writes, fragmented acknowledgements, hostile
 (colon/newline) filenames, oversized headers, and receiver confirmation.
 """
 
+import builtins
 import os
 import socket
 import struct
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import wifile
 
@@ -78,12 +80,30 @@ class FileTransferTest(unittest.TestCase):
     def setUp(self):
         self.send_result: bool | None = None
         self.send_error: Exception | None = None
+        self.server_result: tuple[bytes, bytes] | None = None
 
     def _run_send(self, sock, name, path):
         try:
             self.send_result = wifile.send_one_file(sock, name, path)
         except (OSError, ValueError) as e:  # failure path
             self.send_error = e
+
+    def _run_simple_server(
+        self, sock, name, content, declared_size=None, close_after_send=False
+    ):
+        """Minimal server: header -> ACK -> content -> read result."""
+        try:
+            size = len(content) if declared_size is None else declared_size
+            payload = name.encode("utf-8") + b"\x00" + struct.pack(">Q", size)
+            wifile.send_frame(sock, wifile.KIND_FILE, payload)
+            wifile.recv_frame(sock)  # ACK
+            sock.sendall(content)
+            if close_after_send:
+                sock.close()
+                return
+            self.server_result = wifile.recv_frame(sock)
+        except (OSError, ValueError):
+            pass
 
     def _client_receive(self, sock, expected_size):
         """Play the client side: frame -> ACK -> read content -> RESULT ok."""
@@ -175,6 +195,135 @@ class FileTransferTest(unittest.TestCase):
             self.assertFalse(self.send_result)
         left.close()
         right.close()
+
+    def test_receive_one_file_success(self):
+        """receive_one_file writes the final file and reports success."""
+        left, right = socket.socketpair()
+        data = os.urandom(5000)
+        with tempfile.TemporaryDirectory() as tmp:
+            t = threading.Thread(
+                target=self._run_simple_server, args=(left, "ok.bin", data)
+            )
+            t.start()
+            kind, header_payload = wifile.recv_frame(right)
+            self.assertEqual(kind, wifile.KIND_FILE)
+            result = wifile.receive_one_file(right, tmp, True, False, header_payload)
+            t.join()
+
+            self.assertEqual(result, "file")
+            with open(os.path.join(tmp, "ok.bin"), "rb") as f:
+                self.assertEqual(f.read(), data)
+            self.assertEqual(self.server_result, (wifile.KIND_RESULT, b"\x00"))
+            leftovers = [n for n in os.listdir(tmp) if ".wifile-part" in n]
+            self.assertEqual(leftovers, [])
+        left.close()
+        right.close()
+
+    def test_failed_transfer_does_not_clobber_existing_file(self):
+        """A failed transfer must leave an existing destination intact."""
+        left, right = socket.socketpair()
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "keep.txt")
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write("ORIGINAL")
+
+            t = threading.Thread(
+                target=self._run_simple_server,
+                args=(left, "keep.txt", b"he"),
+                kwargs={"declared_size": 5, "close_after_send": True},
+            )
+            t.start()
+            kind, header_payload = wifile.recv_frame(right)
+            self.assertEqual(kind, wifile.KIND_FILE)
+            result = wifile.receive_one_file(right, tmp, True, False, header_payload)
+            t.join()
+
+            self.assertEqual(result, "file")
+            with open(dest, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), "ORIGINAL")
+            leftovers = [n for n in os.listdir(tmp) if ".wifile-part" in n]
+            self.assertEqual(leftovers, [])
+        left.close()
+        right.close()
+
+    def test_close_failure_is_reported_as_error(self):
+        """A flush/close failure after all bytes must not report success."""
+        left, right = socket.socketpair()
+        content = b"hello"
+        with tempfile.TemporaryDirectory() as tmp:
+            real_open = builtins.open
+
+            class FailingFile:
+                def __init__(self, f):
+                    self._f = f
+
+                def write(self, chunk):
+                    return self._f.write(chunk)
+
+                def close(self):
+                    self._f.close()
+                    raise OSError("simulated close failure")
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    self.close()
+                    return False
+
+            def fake_open(path, mode, *args, **kwargs):
+                return FailingFile(real_open(path, mode, *args, **kwargs))
+
+            t = threading.Thread(
+                target=self._run_simple_server, args=(left, "x.txt", content)
+            )
+            t.start()
+            kind, header_payload = wifile.recv_frame(right)
+            self.assertEqual(kind, wifile.KIND_FILE)
+            with mock.patch("builtins.open", new=fake_open):
+                result = wifile.receive_one_file(
+                    right, tmp, True, False, header_payload
+                )
+            t.join()
+
+            self.assertEqual(result, "file")
+            self.assertEqual(self.server_result, (wifile.KIND_RESULT, b"\x01"))
+            leftovers = [n for n in os.listdir(tmp) if ".wifile-part" in n]
+            self.assertEqual(leftovers, [])
+        left.close()
+        right.close()
+
+
+class SanitizePathTest(unittest.TestCase):
+    def test_removes_parent_traversal(self):
+        self.assertEqual(
+            wifile.sanitize_relative_path("../../etc/passwd"),
+            os.path.join("etc", "passwd"),
+        )
+
+    def test_normalizes_separators(self):
+        self.assertEqual(
+            wifile.sanitize_relative_path("a\\b\\c.txt"),
+            os.path.join("a", "b", "c.txt"),
+        )
+
+    def test_absolute_path_is_relativized(self):
+        self.assertEqual(
+            wifile.sanitize_relative_path("/etc/passwd"),
+            os.path.join("etc", "passwd"),
+        )
+
+    def test_empty_becomes_unnamed(self):
+        self.assertEqual(wifile.sanitize_relative_path(""), "unnamed")
+        self.assertEqual(wifile.sanitize_relative_path("/"), "unnamed")
+
+    @unittest.skipUnless(os.name == "nt", "Windows drive handling")
+    def test_drive_qualified_component_is_stripped(self):
+        self.assertEqual(wifile.sanitize_relative_path("C:/outside.txt"), "outside.txt")
+        self.assertEqual(
+            wifile.sanitize_relative_path("C:\\outside.txt"), "outside.txt"
+        )
+        self.assertEqual(wifile.sanitize_relative_path("C:"), "unnamed")
 
 
 if __name__ == "__main__":
