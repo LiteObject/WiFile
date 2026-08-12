@@ -40,6 +40,9 @@ Run this on the device that has the file you want to send:
 python wifile.py server --file /path/to/your/file.txt
 ```
 
+If you run `python wifile.py server` without `--file` or `--folder`, the
+server prompts you to enter a file or folder path before it starts listening.
+
 ### Server Mode (Sending a folder)
 
 Send all files inside a folder (including subfolders) one by one over a single connection:
@@ -124,8 +127,8 @@ File 'myfile.zip' received and saved to './myfile.zip'.
 ### Server Mode
 | Option | Description | Required | Default |
 |--------|-------------|----------|---------|
-| `--file` | Path to the file to send | One of `--file`/`--folder` | - |
-| `--folder` | Path to the folder whose contents to send one by one (recurses into subfolders) | One of `--file`/`--folder` | - |
+| `--file` | Path to the file to send | No (prompted if omitted) | - |
+| `--folder` | Path to the folder whose contents to send one by one (recurses into subfolders) | No (prompted if omitted) | - |
 | `--port` | Port number to listen on | No | 12345 |
 
 ### Client Mode

@@ -485,6 +485,21 @@ def start_client(
         client_socket.close()
 
 
+def prompt_for_source() -> tuple[str | None, str | None]:
+    """Prompt the user for a file or folder path to send.
+
+    Returns a (filepath, folder) tuple with exactly one of them set.
+    Raises EOFError if input is closed before a valid path is given.
+    """
+    while True:
+        path = input("Enter file or folder path to send: ").strip().strip('"')
+        if os.path.isfile(path):
+            return path, None
+        if os.path.isdir(path):
+            return None, path
+        print(f"Error: '{path}' does not exist. Enter a valid file or folder path.")
+
+
 def main():
     """Parse command-line arguments and run the appropriate mode (server or client)."""
     parser = argparse.ArgumentParser(
@@ -521,10 +536,15 @@ def main():
     args = parser.parse_args()
 
     if args.mode == "server":
-        if not args.file and not args.folder:
-            print("Error: --file or --folder is required in server mode.")
-            sys.exit(1)
-        start_server(args.port, args.file, args.folder)
+        filepath, folder = args.file, args.folder
+        if not filepath and not folder:
+            # No target given on the command line: ask for one interactively.
+            try:
+                filepath, folder = prompt_for_source()
+            except (EOFError, KeyboardInterrupt):
+                print("\nNo path provided. Exiting.")
+                sys.exit(1)
+        start_server(args.port, filepath, folder)
     elif args.mode == "client":
         if not args.host:
             print("Error: --host is required in client mode.")
