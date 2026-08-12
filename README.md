@@ -15,6 +15,7 @@ A simple command-line tool for transferring files over a WiFi network using TCP 
 - **Smart file conflict handling** - Options to overwrite, rename, or cancel
 - **Robust error handling** - Graceful handling of network interruptions
 - **Connection timeouts** - Prevents hanging on network issues
+- **Persistent server** - Keeps serving transfers; resend the same file/folder or switch to a new one after each transfer
 
 ## Requirements
 
@@ -58,6 +59,14 @@ Examples:
 python wifile.py server --file document.pdf --port 8080
 python wifile.py server --folder ./photos --port 8080
 ```
+
+> **Persistent server**: the server does **not** exit after a transfer. After
+> each transfer it prompts for what to serve next:
+> - `s` - send the same file(s)/folder again
+> - `n` - provide a new file or folder path to send
+> - `e` - exit the server
+>
+> Press `Ctrl+C` in the server terminal to stop at any time.
 
 ### Client Mode (Receiving a file)
 
@@ -157,6 +166,10 @@ with a per-file completion confirmation, and finally signals the end of the
 batch. Subfolder structure is preserved on the receiving side. No action is
 needed on the client - it automatically detects a batch transfer and keeps
 receiving until done.
+
+After a client disconnects (transfer finished or aborted), the server asks
+whether to send the same file(s)/folder again, switch to a new file or folder,
+or quit. Run it in its own terminal and press `Ctrl+C` to stop it.
 
 ## File Conflict Handling
 

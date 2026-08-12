@@ -150,10 +150,53 @@ def send_one_file(conn: socket.socket, display_name: str, filepath: str) -> bool
     return True
 
 
+def prompt_next_target(
+    files: list[tuple[str, str]], batch_mode: bool, source: str
+) -> tuple[list[tuple[str, str]], bool, str] | None:
+    """Ask the server operator what to serve next after a transfer.
+
+    Returns a (files, batch_mode, source) tuple for the next round, or None
+    if the operator chose to quit the server.
+    """
+    try:
+        while True:
+            choice = (
+                input(
+                    "\nChoose next action: " "(s)end same, (n)ew file/folder, (e)xit: "
+                )
+                .strip()
+                .lower()
+            )
+            if choice in ("s", "same"):
+                return files, batch_mode, source
+            if choice in ("e", "exit", "q", "quit"):
+                return None
+            if choice in ("n", "new"):
+                path = input("Enter new file or folder path: ").strip().strip('"')
+                if os.path.isfile(path):
+                    return collect_files(filepath=path), False, path
+                if os.path.isdir(path):
+                    new_files = collect_files(folder=path)
+                    if not new_files:
+                        print(f"Error: No files found in folder '{path}'.")
+                        continue
+                    return new_files, True, path
+                print(f"Error: '{path}' does not exist. Please try again.")
+                continue
+            print("Invalid choice. Enter 's', 'n', or 'e'.")
+    except EOFError:
+        return None
+
+
 def start_server(
     port: int, filepath: str | None = None, folder: str | None = None
 ) -> None:
-    """Run the server to send a file, or all files in a folder, to a client."""
+    """Run the server to send a file, or all files in a folder, to clients.
+
+    The server keeps running after each transfer completes. After every
+    transfer it asks the operator whether to serve the same file(s)/folder
+    again, switch to a new file or folder, or quit. Press Ctrl+C to stop.
+    """
     if filepath and not os.path.isfile(filepath):
         print(f"Error: File '{filepath}' does not exist.")
         sys.exit(1)
@@ -167,6 +210,14 @@ def start_server(
         sys.exit(1)
 
     batch_mode = folder is not None
+    source = filepath if filepath else folder
+
+    def print_ready() -> None:
+        """Print what the server is about to send next."""
+        if batch_mode:
+            print(f"Ready to send {len(files)} file(s) from '{source}' (one by one)")
+        else:
+            print(f"Ready to send '{files[0][0]}'")
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind(("0.0.0.0", port))  # Listen on all interfaces
@@ -176,43 +227,54 @@ def start_server(
     print(f"Server listening on port {port}")
     print(f"Server IP address: {local_ip}")
     print(f"Clients can connect using: python wifile.py client --host {local_ip}")
-    if batch_mode:
-        print(f"Ready to send {len(files)} file(s) from '{folder}' (one by one)")
-    else:
-        print(f"Ready to send '{files[0][0]}'")
+    print_ready()
     print("Waiting for connection...")
+    print("Press Ctrl+C to stop the server.")
 
-    conn = None
     try:
-        conn, addr = server_socket.accept()
-        conn.settimeout(30)  # 30 second timeout
-        print(f"Connected by {addr}")
+        while True:
+            conn = None
+            try:
+                conn, addr = server_socket.accept()
+                conn.settimeout(30)  # 30 second timeout
+                print(f"\nConnected by {addr}")
 
-        if batch_mode:
-            # Tell the client how many files to expect
-            conn.send(f"WFILE_BATCH:{len(files)}\n".encode())
-            for display_name, abs_path in files:
-                if not send_one_file(conn, display_name, abs_path):
-                    print("Transfer stopped due to a connection issue.")
+                if batch_mode:
+                    # Tell the client how many files to expect
+                    conn.send(f"WFILE_BATCH:{len(files)}\n".encode())
+                    for display_name, abs_path in files:
+                        if not send_one_file(conn, display_name, abs_path):
+                            print("Transfer stopped due to a connection issue.")
+                            break
+                    else:
+                        conn.send(b"WFILE_DONE\n")
+                        print(f"All {len(files)} file(s) sent successfully.")
+                else:
+                    display_name, abs_path = files[0]
+                    send_one_file(conn, display_name, abs_path)
+            except (socket.error, OSError, IOError) as e:
+                if "10054" in str(e) or "forcibly closed" in str(e).lower():
+                    print(f"\nClient disconnected unexpectedly: {e}")
+                    disconnect_msg = (
+                        "This usually means the client closed the connection "
+                        "or network was interrupted."
+                    )
+                    print(disconnect_msg)
+                else:
+                    print(f"Server error: {e}")
+            finally:
+                if conn is not None:
+                    conn.close()
+                next_target = prompt_next_target(files, batch_mode, source)
+                if next_target is None:
+                    print("Server stopped by user.")
                     return
-            conn.send(b"WFILE_DONE\n")
-            print(f"All {len(files)} file(s) sent successfully.")
-        else:
-            display_name, abs_path = files[0]
-            send_one_file(conn, display_name, abs_path)
-    except (socket.error, OSError, IOError) as e:
-        if "10054" in str(e) or "forcibly closed" in str(e).lower():
-            print(f"\nClient disconnected unexpectedly: {e}")
-            disconnect_msg = (
-                "This usually means the client closed the connection "
-                "or network was interrupted."
-            )
-            print(disconnect_msg)
-        else:
-            print(f"Server error: {e}")
+                files, batch_mode, source = next_target
+                print_ready()
+                print("Waiting for next connection... (Ctrl+C to stop)")
+    except KeyboardInterrupt:
+        print("\nServer stopped by user.")
     finally:
-        if conn is not None:
-            conn.close()
         server_socket.close()
 
 
