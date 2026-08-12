@@ -239,7 +239,10 @@ Look for the IP address under your WiFi adapter (usually starts with 192.168.x.x
 - Files are transmitted in plain text
 - Only use on trusted networks (home, office)
 - Firewall may need to be configured to allow connections
-- 30-second connection timeouts help prevent hanging connections
+- 30-second connection timeouts help prevent hanging connections during transfers
+- The server waits up to 5 minutes for a client to accept or decline a file,
+  so an unanswered conflict prompt cannot occupy the server's connection
+  indefinitely
 
 ## Troubleshooting
 

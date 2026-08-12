@@ -117,6 +117,11 @@ KIND_DONE = b"\x05"  # payload: empty (batch finished)
 
 MAX_HEADER_PAYLOAD = 1 << 20  # 1 MiB cap for a file header (name + size)
 
+# How long the server waits for the client to accept or decline a file.
+# Bounded so a silent client cannot hold the server's only connection
+# forever, yet generous enough for a user answering an interactive prompt.
+DECISION_TIMEOUT = 300  # seconds
+
 
 def recv_exact(sock: socket.socket, count: int) -> bytes:
     """Read exactly ``count`` bytes, raising ConnectionError on early EOF."""
@@ -155,17 +160,22 @@ def recv_frame(
 def sanitize_relative_path(path: str) -> str:
     """Clean a remote filename so it stays inside the output directory.
 
-    Normalizes separators, strips drive/UNC prefixes and any leading
-    slashes, removes traversal components ('..', '.', ''), and falls back
-    to 'unnamed' when nothing remains. The result is always a plain
-    relative path, so joining it onto the output directory cannot escape.
+    Normalizes separators, strips drive prefixes from every component (a
+    drive-qualified component anywhere in the path, such as
+    'foo/C:/bar.txt', is just as dangerous as one at the start), removes
+    traversal components ('..', '.', ''), and falls back to 'unnamed' when
+    nothing remains. The result is always a plain relative path, so joining
+    it onto the output directory cannot escape.
     """
     if not path:
         return "unnamed"
     normalized = path.replace("\\", "/")
-    normalized = re.sub(r"^[A-Za-z]:", "", normalized)  # strip drive prefix
-    normalized = normalized.lstrip("/")
-    parts = [p for p in normalized.split("/") if p not in ("", ".", "..")]
+    parts: list[str] = []
+    for part in normalized.split("/"):
+        part = re.sub(r"^[A-Za-z]:", "", part)  # strip any drive prefix
+        if part in ("", ".", ".."):
+            continue
+        parts.append(part)
     return os.path.join(*parts) if parts else "unnamed"
 
 
@@ -215,12 +225,20 @@ def send_one_file(conn: socket.socket, display_name: str, filepath: str) -> bool
         print(f"Connection lost while sending header: {e}")
         return False
 
-    # Wait for the client's decision. The client may be prompting the user,
-    # so do not impose the idle timeout while we wait.
+    # Wait for the client's decision (ACK to proceed, RESULT to decline).
+    # The client may be prompting the user, so the wait is generous, but it
+    # is still bounded so a silent client cannot hold the server's only
+    # connection forever.
     old_timeout = conn.gettimeout()
-    conn.settimeout(None)
+    conn.settimeout(DECISION_TIMEOUT)
     try:
         kind, _ = recv_frame(conn)
+    except socket.timeout:
+        print(
+            f"Timeout ({DECISION_TIMEOUT}s) waiting for the client to accept "
+            f"or decline '{display_name}'. Aborting transfer."
+        )
+        return False
     except (socket.error, OSError, ValueError) as e:
         print(f"Connection lost while waiting for acknowledgment: {e}")
         return False
@@ -446,6 +464,26 @@ def receive_one_file(
         print(f"Warning: Path sanitized from '{filename}' to '{safe_name}'")
 
     output_path = os.path.join(output_dir, safe_name)
+
+    # Defense in depth: the sanitized name must resolve inside the output
+    # directory. If it ever escapes (for example a drive-qualified component
+    # slipping through), reject the transfer instead of writing outside.
+    resolved_output = os.path.normcase(os.path.abspath(output_dir))
+    resolved_path = os.path.normcase(os.path.abspath(output_path))
+    if not (
+        resolved_path == resolved_output
+        or resolved_path.startswith(resolved_output + os.sep)
+    ):
+        print(
+            f"Warning: path '{safe_name}' resolves outside the output "
+            f"directory '{output_dir}'; rejecting the transfer."
+        )
+        try:
+            send_frame(client_socket, KIND_RESULT, b"\x01")
+        except (socket.error, OSError):
+            pass
+        return "file"
+
     output_parent = os.path.dirname(output_path)
     if output_parent:
         os.makedirs(output_parent, exist_ok=True)
@@ -586,6 +624,64 @@ def prompt_next_output(output_dir: str) -> str | None:
         return None
 
 
+def receive_batch(
+    client_socket: socket.socket,
+    output_dir: str,
+    auto_overwrite: bool,
+    auto_rename: bool,
+    batch_payload: bytes,
+) -> None:
+    """Receive a batch of files until KIND_DONE, validating completion.
+
+    The batch payload carries the announced file count. The batch is only
+    reported as complete when a KIND_DONE frame arrives and the number of
+    files received matches the announced count. Unexpected frame kinds and
+    files beyond the announced count abort the batch with an error message.
+    """
+    try:
+        total = struct.unpack(">I", batch_payload)[0]
+    except struct.error:
+        total = 0
+    print(f"Receiving batch of {total} file(s)...")
+    received_count = 0
+    cancelled = False
+    done = False
+    while True:
+        kind, header_payload = recv_frame(client_socket)
+        if kind == KIND_DONE:
+            done = True
+            break
+        if kind != KIND_FILE or received_count >= total:
+            print(f"Unexpected message from server: {kind!r}")
+            break
+        result = receive_one_file(
+            client_socket,
+            output_dir,
+            auto_overwrite,
+            auto_rename,
+            header_payload,
+        )
+        if result == "cancelled":
+            cancelled = True
+            break
+        received_count += 1
+
+    if cancelled:
+        print("Batch transfer cancelled.")
+    elif done and received_count == total:
+        print(f"Batch complete: {received_count} of {total} file(s) received.")
+    elif done:
+        print(
+            f"Error: server ended the batch early "
+            f"({received_count} of {total} file(s) received)."
+        )
+    else:
+        print(
+            f"Error: batch ended unexpectedly "
+            f"({received_count} of {total} file(s) received)."
+        )
+
+
 def start_client(
     host: str,
     port: int,
@@ -610,39 +706,13 @@ def start_client(
                 first_kind, first_payload = recv_frame(client_socket)
 
                 if first_kind == KIND_BATCH:
-                    # Batch transfer: receive files one by one until KIND_DONE
-                    try:
-                        total = struct.unpack(">I", first_payload)[0]
-                    except struct.error:
-                        total = 0
-                    print(f"Receiving batch of {total} file(s)...")
-                    received_count = 0
-                    cancelled = False
-                    while True:
-                        kind, header_payload = recv_frame(client_socket)
-                        if kind == KIND_DONE:
-                            break
-                        if kind != KIND_FILE:
-                            print(f"Unexpected message from server: {kind!r}")
-                            break
-                        result = receive_one_file(
-                            client_socket,
-                            output_dir,
-                            auto_overwrite,
-                            auto_rename,
-                            header_payload,
-                        )
-                        if result == "cancelled":
-                            cancelled = True
-                            break
-                        received_count += 1
-                    if cancelled:
-                        print("Batch transfer cancelled.")
-                    else:
-                        print(
-                            f"Batch complete: {received_count} of {total} "
-                            "file(s) received."
-                        )
+                    receive_batch(
+                        client_socket,
+                        output_dir,
+                        auto_overwrite,
+                        auto_rename,
+                        first_payload,
+                    )
                 else:
                     # Single file transfer
                     result = receive_one_file(

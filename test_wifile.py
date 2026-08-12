@@ -6,6 +6,7 @@ raised in review: partial reads/writes, fragmented acknowledgements, hostile
 """
 
 import builtins
+import io
 import os
 import socket
 import struct
@@ -13,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 import wifile
@@ -294,6 +296,28 @@ class FileTransferTest(unittest.TestCase):
         left.close()
         right.close()
 
+    def test_silent_client_is_bounded_by_decision_timeout(self):
+        """A client that never answers must not hold the sender forever."""
+        left, right = socket.socketpair()
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "x.txt")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write("hello")
+
+            with mock.patch.object(wifile, "DECISION_TIMEOUT", 0.2):
+                t = threading.Thread(target=self._run_send, args=(left, "x.txt", src))
+                t.start()
+                # Read the header, then never respond.
+                kind, _ = wifile.recv_frame(right)
+                self.assertEqual(kind, wifile.KIND_FILE)
+                t.join(timeout=5)
+
+            self.assertFalse(t.is_alive())
+            self.assertIsNone(getattr(self, "send_error", None))
+            self.assertFalse(self.send_result)
+        left.close()
+        right.close()
+
 
 class SanitizePathTest(unittest.TestCase):
     def test_removes_parent_traversal(self):
@@ -336,6 +360,22 @@ class SanitizePathTest(unittest.TestCase):
     def test_drive_relative_name_is_confined(self):
         """A drive-relative name like C:foo must not escape output_dir."""
         self.assertEqual(wifile.sanitize_relative_path("C:foo.txt"), "foo.txt")
+
+    @unittest.skipUnless(os.name == "nt", "Windows drive handling")
+    def test_nested_drive_component_is_stripped(self):
+        """A drive-qualified component anywhere must not survive."""
+        self.assertEqual(
+            wifile.sanitize_relative_path("foo/C:/sub/evil.txt"),
+            os.path.join("foo", "sub", "evil.txt"),
+        )
+        self.assertEqual(
+            wifile.sanitize_relative_path("foo/C:sub/evil.txt"),
+            os.path.join("foo", "sub", "evil.txt"),
+        )
+        self.assertEqual(
+            wifile.sanitize_relative_path("foo/C:/evil.txt"),
+            os.path.join("foo", "evil.txt"),
+        )
 
 
 class PromptNextTargetTest(unittest.TestCase):
@@ -549,9 +589,6 @@ class BatchProtocolTest(unittest.TestCase):
 class ServerMessageTest(unittest.TestCase):
     def test_custom_port_included_in_client_command(self):
         """A server on a custom port must tell clients to pass --port."""
-        import io
-        from contextlib import redirect_stdout
-
         with tempfile.TemporaryDirectory() as tmp:
             fpath = os.path.join(tmp, "f.txt")
             with open(fpath, "w", encoding="utf-8") as f:
@@ -597,6 +634,104 @@ class ServerMessageTest(unittest.TestCase):
             output = buf.getvalue()
             self.assertIn("--port", output)
             self.assertIn(str(port), output)
+
+
+class BatchValidationTest(unittest.TestCase):
+    """A batch is only complete on KIND_DONE with a matching file count."""
+
+    def _serve_one_file(self, left, name, content):
+        """Server side of a single-file handshake on the given socket."""
+        payload = name.encode("utf-8") + b"\x00" + struct.pack(">Q", len(content))
+        wifile.send_frame(left, wifile.KIND_FILE, payload)
+        wifile.recv_frame(left)  # ACK
+        left.sendall(content)
+        wifile.recv_frame(left)  # RESULT
+
+    def test_successful_batch_reports_complete(self):
+        left, right = socket.socketpair()
+        with tempfile.TemporaryDirectory() as tmp:
+
+            def server():
+                try:
+                    self._serve_one_file(left, "a.txt", b"hi")
+                    wifile.send_frame(left, wifile.KIND_DONE)
+                except (OSError, ValueError):  # pragma: no cover
+                    pass
+                finally:
+                    left.close()
+
+            t = threading.Thread(target=server)
+            t.start()
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                wifile.receive_batch(right, tmp, True, False, struct.pack(">I", 1))
+            t.join(timeout=5)
+            self.assertFalse(t.is_alive())
+
+            self.assertIn("Batch complete: 1 of 1", buf.getvalue())
+            with open(os.path.join(tmp, "a.txt"), "rb") as f:
+                self.assertEqual(f.read(), b"hi")
+        left.close()
+        right.close()
+
+    def test_early_done_is_rejected(self):
+        """KIND_DONE before the announced count must not report completion."""
+        left, right = socket.socketpair()
+        with tempfile.TemporaryDirectory() as tmp:
+            wifile.send_frame(left, wifile.KIND_DONE)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                wifile.receive_batch(right, tmp, True, False, struct.pack(">I", 2))
+            output = buf.getvalue()
+            self.assertNotIn("Batch complete", output)
+            self.assertIn("ended the batch early", output)
+            self.assertIn("0 of 2", output)
+        left.close()
+        right.close()
+
+    def test_unexpected_frame_kind_is_rejected(self):
+        """A non-KIND_FILE/non-KIND_DONE frame must not report completion."""
+        left, right = socket.socketpair()
+        with tempfile.TemporaryDirectory() as tmp:
+            wifile.send_frame(left, wifile.KIND_ACK)  # unexpected kind
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                wifile.receive_batch(right, tmp, True, False, struct.pack(">I", 2))
+            output = buf.getvalue()
+            self.assertNotIn("Batch complete", output)
+            self.assertIn("ended unexpectedly", output)
+        left.close()
+        right.close()
+
+    def test_extra_file_beyond_announced_count_is_rejected(self):
+        """More files than announced must not be accepted silently."""
+        left, right = socket.socketpair()
+        with tempfile.TemporaryDirectory() as tmp:
+
+            def server():
+                try:
+                    self._serve_one_file(left, "a.txt", b"hi")
+                    # Second, unannounced file (the batch announced only 1).
+                    payload = b"b.txt\x00" + struct.pack(">Q", 2)
+                    wifile.send_frame(left, wifile.KIND_FILE, payload)
+                except (OSError, ValueError):  # pragma: no cover
+                    pass
+                finally:
+                    left.close()
+
+            t = threading.Thread(target=server)
+            t.start()
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                wifile.receive_batch(right, tmp, True, False, struct.pack(">I", 1))
+            t.join(timeout=5)
+            self.assertFalse(t.is_alive())
+
+            output = buf.getvalue()
+            self.assertNotIn("Batch complete", output)
+            self.assertIn("ended unexpectedly", output)
+        left.close()
+        right.close()
 
 
 if __name__ == "__main__":
