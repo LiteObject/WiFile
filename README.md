@@ -280,6 +280,27 @@ If the requested port is unavailable (common on Windows, where some ports
 are reserved by the system), WiFile automatically falls back to a free port
 and prints the actual address.
 
+### Docker
+
+The web UI is pure standard library, so it runs in a tiny container. A
+`Dockerfile` and `docker-compose.yml` are included:
+
+```bash
+docker build -t wifile .
+docker run -d -p 8765:8765 -p 12345:12345 -v C:\path\to\files:/data wifile
+# or: docker compose up -d
+```
+
+Notes:
+
+- **Publish both ports** — 8765 for the UI and 12345 (or your custom
+  transfer port) for sending.
+- **Mount the folders** you want to send or receive with `-v`.
+- **Peers use the host's LAN IP**, not the address the UI prints (that is
+  the container's internal address).
+- Inside the container the UI binds to `0.0.0.0` on a fixed port, as
+  described above.
+
 > ⚠️ The web UI binds to localhost by default. With `--host 0.0.0.0`, anyone
 > who can reach the page can make this machine send arbitrary local files —
 > there is no authentication. Only expose it on trusted networks.
