@@ -1,6 +1,9 @@
 # WiFile
 
-A simple command-line tool for transferring files over a WiFi network using TCP sockets. WiFile allows you to quickly send files between devices on the same network without requiring cloud services or external dependencies.
+A simple tool for transferring files over a WiFi network using TCP sockets —
+no cloud services or external dependencies. WiFile lets you quickly send files
+between devices on the same network from the **command line** or from a
+**browser** (`python webui.py`, see [Web UI](#web-ui)).
 
 ## Features
 
@@ -9,6 +12,8 @@ A simple command-line tool for transferring files over a WiFi network using TCP 
 - **Network-based** - Works over any TCP/IP network (WiFi, Ethernet, etc.)
 - **Any file type** - Transfer any file regardless of format or size
 - **Command-line interface** - Easy to use from terminal/command prompt
+- **Web interface** - Operate WiFile from any browser: drag-and-drop sending,
+  live progress, and per-file status (see [Web UI](#web-ui))
 - **Lightweight** - Pure Python with no external dependencies
 - **Real-time progress bar** - Visual transfer progress with speed and ETA
 - **Automatic IP display** - Server shows its IP address for easy connection
@@ -28,10 +33,15 @@ A simple command-line tool for transferring files over a WiFi network using TCP 
 1. Clone or download the repository
 2. Ensure Python 3.x is installed on your system
 3. No additional dependencies required - uses only Python standard library
+4. The browser interface needs nothing extra either: run `python webui.py`
+   (see [Web UI](#web-ui))
 
 ## Usage
 
 WiFile operates in two modes: **server** (sender) and **client** (receiver).
+Prefer a browser? Run `python webui.py` and open the page it prints — the web
+UI and the CLI use the same engine and are fully interchangeable
+(see [Web UI](#web-ui)).
 
 ### Server Mode (Sending a file)
 
@@ -243,6 +253,36 @@ Look for the IP address under your WiFi adapter (usually starts with 192.168.x.x
 - The server waits up to 5 minutes for a client to accept or decline a file,
   so an unanswered conflict prompt cannot occupy the server's connection
   indefinitely
+
+## Web UI
+
+WiFile also ships with a browser-based interface, so any device on the
+network — laptop, tablet, or phone — can send and receive files without
+installing anything.
+
+```bash
+python webui.py
+```
+
+Then open <http://127.0.0.1:8765> in a browser. The page has two panes:
+
+- **Send** — drop files or a folder onto the page (or pick them), then start
+  the sender. Progress, speed, ETA, and per-file status update live.
+- **Receive** — enter the sender's address and output folder. Name conflicts
+  can be answered per file or handled automatically.
+
+Options:
+
+- `--port` — web UI port (default: 8765)
+- `--host` — bind address (default: `127.0.0.1`)
+
+> ⚠️ The web UI binds to localhost by default. With `--host 0.0.0.0`, anyone
+> who can reach the page can make this machine send arbitrary local files —
+> there is no authentication. Only expose it on trusted networks.
+
+The web UI uses the same transfer engine and wire protocol as the CLI, so the
+two are fully interchangeable: a browser sender works with a CLI receiver and
+vice versa.
 
 ## Troubleshooting
 

@@ -189,8 +189,11 @@ WiFile/
    prompt buttons, start/stop forms; verified against the existing CLI peer.
    (Done; light theme, SSE live indicator, upload pickers, per-file chips.)
 4. **Live updates** — SSE stream with polling fallback; batch file list.
-5. **Polish** — localhost-by-default warning, graceful shutdown on Stop and on
-   browser disconnect, error dialogs for bad paths/ports.
+5. **Polish** ✅ — localhost-by-default warning (webui.py), graceful shutdown
+   on Stop and on browser disconnect (SSE handlers + prompt timeouts),
+   synchronous source validation with toast errors, client-side port
+   validation, startup-failure toasts, Enter-to-start, favicon, README
+   section. (Done; 64 tests green, verified in browser.)
 
 ## Risks
 

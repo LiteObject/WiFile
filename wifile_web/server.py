@@ -310,10 +310,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         params: dict[str, Any] = {"port": port}
         if mode == "server":
-            source = data.get("source")
+            source = str(data.get("source") or "")
             if not source:
                 raise _RequestError(400, "'source' (file or folder path) is required")
-            params["source"] = str(source)
+            if not (os.path.isfile(source) or os.path.isdir(source)):
+                raise _RequestError(400, f"source does not exist: {source}")
+            params["source"] = source
         else:
             host = data.get("host")
             if not host:

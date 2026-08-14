@@ -278,6 +278,14 @@ class ServerApiTest(unittest.TestCase):
         )
         self.assertEqual(status, 400)
 
+    def test_start_server_rejects_nonexistent_source(self):
+        status, _, raw = self._post_json(
+            "/api/start",
+            {"mode": "server", "port": free_port(), "source": "/nonexistent/xyz"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn(b"does not exist", raw)
+
     def test_start_client_requires_host(self):
         status, _, _ = self._post_json("/api/start", {"mode": "client"})
         self.assertEqual(status, 400)

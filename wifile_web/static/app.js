@@ -47,6 +47,8 @@ const els = {
 
 let pollTimer = null;
 let toastTimer = null;
+const lastLogLen = { server: 0, client: 0 };
+const failToasted = { server: false, client: false };
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -121,6 +123,10 @@ function renderPane(mode, slot) {
     ).forEach((node) => {
         node.disabled = slot.running;
     });
+    if (mode === MODE.SERVER) {
+        ui.drop.classList.toggle("disabled", slot.running);
+    }
+    watchForStartFailure(mode, slot);
 
     const last = slot.log.length ? slot.log[slot.log.length - 1] : "";
     ui.status.textContent = last || (slot.running ? "Starting…" : "Idle");
@@ -141,6 +147,24 @@ function renderPane(mode, slot) {
     renderPrompt(mode, slot.prompt, ui);
     renderFiles(mode, slot.log, ui);
     renderLog(slot.log, ui);
+}
+
+// Surface engine startup failures (bad port in use, vanished source, …) as a
+// toast once per engine round instead of leaving them buried in the log.
+function watchForStartFailure(mode, slot) {
+    const fresh = slot.log.slice(lastLogLen[mode]);
+    lastLogLen[mode] = slot.log.length;
+    if (slot.running) {
+        failToasted[mode] = false; // a new engine round is active
+        return;
+    }
+    if (!failToasted[mode]) {
+        const failure = fresh.find((line) => /failed to start/i.test(line));
+        if (failure) {
+            failToasted[mode] = true;
+            toast(failure);
+        }
+    }
 }
 
 function promptLabel(prompt) {
@@ -281,10 +305,20 @@ function renderLog(log, ui) {
 // API actions
 // ---------------------------------------------------------------------------
 
+function parsePort(input) {
+    const port = parseInt(input.value, 10);
+    if (Number.isNaN(port) || port < 1 || port > 65535) {
+        toast("Port must be between 1 and 65535");
+        return null;
+    }
+    return port;
+}
+
 async function startServer() {
     const source = els.server.source.value.trim();
     if (!source) return toast("Choose a file or folder to send first");
-    const port = parseInt(els.server.port.value, 10) || 12345;
+    const port = parsePort(els.server.port);
+    if (port === null) return;
     try {
         await api("/api/start", { mode: MODE.SERVER, port, source });
     } catch (error) {
@@ -308,7 +342,8 @@ function conflictChoice() {
 async function startClient() {
     const host = els.client.host.value.trim();
     if (!host) return toast("Enter the server address first");
-    const port = parseInt(els.client.port.value, 10) || 12345;
+    const port = parsePort(els.client.port);
+    if (port === null) return;
     const output = els.client.output.value.trim() || ".";
     try {
         await api("/api/start", {
@@ -481,6 +516,13 @@ document.addEventListener("DOMContentLoaded", () => {
     els.server.stop.addEventListener("click", stopServer);
     els.client.start.addEventListener("click", startClient);
     els.client.stop.addEventListener("click", stopClient);
+
+    els.server.source.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") startServer();
+    });
+    els.client.host.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") startClient();
+    });
 
     bindDrop(els.server.drop);
     bindPicker(

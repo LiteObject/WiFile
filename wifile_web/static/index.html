@@ -5,6 +5,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>WiFile Web</title>
+    <link rel="icon"
+        href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232563eb'/><path d='M16 7l7 7h-4v9h-6v-9h-4z' fill='white'/></svg>">
     <link rel="stylesheet" href="style.css">
 </head>
 
@@ -34,7 +36,7 @@
 
             <div class="row">
                 <label class="field grow">Source
-                    <input id="server-source" placeholder="File or folder path on this machine">
+                    <input id="server-source" type="text" placeholder="File or folder path on this machine">
                 </label>
                 <label class="field slim">Port
                     <input id="server-port" type="number" min="1" max="65535" value="12345">
@@ -70,7 +72,7 @@
 
             <div class="row">
                 <label class="field grow">Server address
-                    <input id="client-host" placeholder="192.168.1.50">
+                    <input id="client-host" type="text" placeholder="192.168.1.50">
                 </label>
                 <label class="field slim">Port
                     <input id="client-port" type="number" min="1" max="65535" value="12345">
@@ -78,7 +80,7 @@
             </div>
 
             <label class="field">Save to
-                <input id="client-output" placeholder="Output directory (default: current)">
+                <input id="client-output" type="text" placeholder="Output directory (default: current)">
             </label>
 
             <fieldset class="conflict">
