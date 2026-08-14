@@ -23,6 +23,14 @@ file count and finishes with a KIND_DONE frame. If the client declines a
 file (for example the user cancels during conflict resolution), it sends a
 KIND_RESULT failure frame instead of a KIND_ACK and the server stops the
 batch.
+
+User interface
+--------------
+All operator interaction goes through a :class:`UI` implementation. The
+default :class:`ConsoleUI` reproduces the original command-line behavior
+(print + input) exactly, so the CLI is unchanged. A web or graphical front
+end passes its own implementation to ``start_server`` / ``start_client`` and
+receives structured events (messages, progress, prompts) instead.
 """
 
 from __future__ import annotations
@@ -34,6 +42,8 @@ import socket
 import struct
 import sys
 import time
+from collections.abc import Sequence
+from typing import Protocol
 
 
 def format_bytes(bytes_value: float) -> str:
@@ -89,6 +99,70 @@ def show_progress(
 
     if current >= total:
         print()  # New line when complete
+
+
+class UI(Protocol):
+    """Interface through which the transfer engine talks to its operator.
+
+    The CLI uses :class:`ConsoleUI`, which reproduces the original print/
+    input behavior exactly. A web or graphical front end supplies its own
+    implementation to receive structured events instead of parsing terminal
+    output.
+
+    ``choose`` presents ``prompt`` and returns one of ``options`` (the
+    console also prints ``invalid`` and re-prompts on bad input; ``default``
+    is only meaningful to non-console UIs). ``ask_text`` asks for free-form
+    input such as a path. ``should_stop`` is polled between rounds so a UI
+    can end a persistent server/client without Ctrl+C.
+    """
+
+    def message(self, text: str) -> None: ...
+
+    def progress(
+        self, current: float, total: float, start_time: float | None = None
+    ) -> None: ...
+
+    def choose(
+        self, prompt: str, options: Sequence[str], default: str, invalid: str
+    ) -> str: ...
+
+    def ask_text(self, prompt: str) -> str: ...
+
+    def should_stop(self) -> bool: ...
+
+
+class ConsoleUI:
+    """Console implementation of the UI protocol: the original CLI behavior.
+
+    Every method reproduces what the CLI did before the UI seam existed, so
+    the command-line interface is byte-for-byte identical. ``input`` and
+    ``print`` are resolved at call time, so tests that mock ``builtins.input``
+    or redirect stdout keep working.
+    """
+
+    def message(self, text: str) -> None:
+        print(text)
+
+    def progress(
+        self, current: float, total: float, start_time: float | None = None
+    ) -> None:
+        show_progress(current, total, start_time)
+
+    def choose(
+        self, prompt: str, options: Sequence[str], default: str, invalid: str
+    ) -> str:
+        del default  # the console never auto-selects; only non-console UIs use it
+        while True:
+            choice = input(prompt).strip().lower()
+            if choice in options:
+                return choice
+            print(invalid)
+
+    def ask_text(self, prompt: str) -> str:
+        return input(prompt).strip().strip('"')
+
+    def should_stop(self) -> bool:
+        return False
 
 
 def get_local_ip():
@@ -202,7 +276,9 @@ def collect_files(
     return files
 
 
-def send_one_file(conn: socket.socket, display_name: str, filepath: str) -> bool:
+def send_one_file(
+    conn: socket.socket, display_name: str, filepath: str, *, ui: UI | None = None
+) -> bool:
     """Send a single file over an open connection. Returns True on success.
 
     Sends a KIND_FILE header frame, waits for the client's decision
@@ -210,10 +286,13 @@ def send_one_file(conn: socket.socket, display_name: str, filepath: str) -> bool
     ``sendall``, then waits for a KIND_RESULT completion frame so the sender
     learns whether the receiver actually wrote the file.
     """
+    if ui is None:
+        ui = ConsoleUI()
+
     try:
         filesize = os.path.getsize(filepath)
     except OSError as e:
-        print(f"Error reading '{filepath}': {e}")
+        ui.message(f"Error reading '{filepath}': {e}")
         return False
 
     header_payload = (
@@ -222,7 +301,7 @@ def send_one_file(conn: socket.socket, display_name: str, filepath: str) -> bool
     try:
         send_frame(conn, KIND_FILE, header_payload)
     except (socket.error, OSError) as e:
-        print(f"Connection lost while sending header: {e}")
+        ui.message(f"Connection lost while sending header: {e}")
         return False
 
     # Wait for the client's decision (ACK to proceed, RESULT to decline).
@@ -234,26 +313,26 @@ def send_one_file(conn: socket.socket, display_name: str, filepath: str) -> bool
     try:
         kind, _ = recv_frame(conn)
     except socket.timeout:
-        print(
+        ui.message(
             f"Timeout ({DECISION_TIMEOUT}s) waiting for the client to accept "
             f"or decline '{display_name}'. Aborting transfer."
         )
         return False
     except (socket.error, OSError, ValueError) as e:
-        print(f"Connection lost while waiting for acknowledgment: {e}")
+        ui.message(f"Connection lost while waiting for acknowledgment: {e}")
         return False
     finally:
         conn.settimeout(old_timeout)
 
     if kind == KIND_RESULT:
-        print(f"Client declined '{display_name}'.")
+        ui.message(f"Client declined '{display_name}'.")
         return False
     if kind != KIND_ACK:
-        print("Client did not acknowledge header properly.")
+        ui.message("Client did not acknowledge header properly.")
         return False
 
     # Send file content with progress bar
-    print(f"Sending '{display_name}' ({format_bytes(filesize)})...")
+    ui.message(f"Sending '{display_name}' ({format_bytes(filesize)})...")
     sent_bytes = 0
     start_time = time.time()
 
@@ -265,71 +344,79 @@ def send_one_file(conn: socket.socket, display_name: str, filepath: str) -> bool
                     break
                 conn.sendall(data)
                 sent_bytes += len(data)
-                show_progress(sent_bytes, filesize, start_time)
+                ui.progress(sent_bytes, filesize, start_time)
     except (socket.error, OSError) as e:
-        print(f"\nConnection lost during transfer: {e}")
+        ui.message(f"\nConnection lost during transfer: {e}")
         transfer_msg = (
             f"Transfer incomplete: {format_bytes(sent_bytes)} "
             f"of {format_bytes(filesize)} sent"
         )
-        print(transfer_msg)
+        ui.message(transfer_msg)
         return False
 
     # Wait for the client's completion result.
     try:
         kind, result = recv_frame(conn)
     except (socket.error, OSError, ValueError) as e:
-        print(f"Connection lost while waiting for completion result: {e}")
+        ui.message(f"Connection lost while waiting for completion result: {e}")
         return False
 
     if kind == KIND_RESULT and result == b"\x00":
-        print(f"File '{display_name}' sent successfully.")
+        ui.message(f"File '{display_name}' sent successfully.")
         return True
     if kind == KIND_RESULT:
-        print(f"Client reported a problem saving '{display_name}'.")
+        ui.message(f"Client reported a problem saving '{display_name}'.")
         return False
-    print("Unexpected response from client after transfer.")
+    ui.message("Unexpected response from client after transfer.")
     return False
 
 
 def prompt_next_target(
-    files: list[tuple[str, str]], batch_mode: bool, source: str
+    files: list[tuple[str, str]],
+    batch_mode: bool,
+    source: str,
+    *,
+    ui: UI | None = None,
 ) -> tuple[list[tuple[str, str]], bool, str] | None:
     """Ask the server operator what to serve next after a transfer.
 
     Returns a (files, batch_mode, source) tuple for the next round, or None
     if the operator chose to quit the server.
     """
+    if ui is None:
+        ui = ConsoleUI()
     try:
         while True:
-            choice = (
-                input("\nChoose next action: (s)end same, (n)ew file/folder, (e)xit: ")
-                .strip()
-                .lower()
+            choice = ui.choose(
+                "\nChoose next action: (s)end same, (n)ew file/folder, (e)xit: ",
+                ["s", "same", "n", "new", "e", "exit", "q", "quit"],
+                "s",
+                "Invalid choice. Enter 's', 'n', or 'e'.",
             )
             if choice in ("s", "same"):
                 return files, batch_mode, source
             if choice in ("e", "exit", "q", "quit"):
                 return None
-            if choice in ("n", "new"):
-                path = input("Enter new file or folder path: ").strip().strip('"')
-                if os.path.isfile(path):
-                    return collect_files(filepath=path), False, path
-                if os.path.isdir(path):
-                    new_files = collect_files(folder=path)
-                    if not new_files:
-                        print(f"Error: No files found in folder '{path}'.")
-                        continue
-                    return new_files, True, path
-                print(f"Error: '{path}' does not exist. Please try again.")
-                continue
-            print("Invalid choice. Enter 's', 'n', or 'e'.")
+            path = ui.ask_text("Enter new file or folder path: ")
+            if os.path.isfile(path):
+                return collect_files(filepath=path), False, path
+            if os.path.isdir(path):
+                new_files = collect_files(folder=path)
+                if not new_files:
+                    ui.message(f"Error: No files found in folder '{path}'.")
+                    continue
+                return new_files, True, path
+            ui.message(f"Error: '{path}' does not exist. Please try again.")
     except EOFError:
         return None
 
 
 def start_server(
-    port: int, filepath: str | None = None, folder: str | None = None
+    port: int,
+    filepath: str | None = None,
+    folder: str | None = None,
+    *,
+    ui: UI | None = None,
 ) -> None:
     """Run the server to send a file, or all files in a folder, to clients.
 
@@ -337,12 +424,19 @@ def start_server(
     transfer it asks the operator whether to serve the same file(s)/folder
     again, switch to a new file or folder, or quit. Press Ctrl+C to stop.
     """
+    if ui is None:
+        ui = ConsoleUI()
+
     if filepath and not os.path.isfile(filepath):
-        print(f"Error: File '{filepath}' does not exist.")
-        sys.exit(1)
+        ui.message(f"Error: File '{filepath}' does not exist.")
+        if isinstance(ui, ConsoleUI):
+            sys.exit(1)
+        raise ValueError(f"File '{filepath}' does not exist")
     if folder and not os.path.isdir(folder):
-        print(f"Error: Folder '{folder}' does not exist.")
-        sys.exit(1)
+        ui.message(f"Error: Folder '{folder}' does not exist.")
+        if isinstance(ui, ConsoleUI):
+            sys.exit(1)
+        raise ValueError(f"Folder '{folder}' does not exist")
 
     if filepath:
         files = collect_files(filepath=filepath)
@@ -355,81 +449,93 @@ def start_server(
     else:
         # main() prompts for a source when neither option is given, so this
         # branch should not be reachable from the CLI.
-        print("Error: No file or folder specified.")
-        sys.exit(1)
+        ui.message("Error: No file or folder specified.")
+        if isinstance(ui, ConsoleUI):
+            sys.exit(1)
+        raise ValueError("No file or folder specified")
 
     if not files:
-        print("Error: No files found to send.")
-        sys.exit(1)
+        ui.message("Error: No files found to send.")
+        if isinstance(ui, ConsoleUI):
+            sys.exit(1)
+        raise ValueError("No files found to send")
 
     def print_ready() -> None:
-        """Print what the server is about to send next."""
+        """Report what the server is about to send next."""
         if batch_mode:
-            print(f"Ready to send {len(files)} file(s) from '{source}' (one by one)")
+            ui.message(
+                f"Ready to send {len(files)} file(s) from '{source}' (one by one)"
+            )
         else:
-            print(f"Ready to send '{files[0][0]}'")
+            ui.message(f"Ready to send '{files[0][0]}'")
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.bind(("0.0.0.0", port))  # Listen on all interfaces
     server_socket.listen(1)
+    # Poll accept() so a UI's stop flag is honored while waiting for the
+    # next connection; invisible to the console user.
+    server_socket.settimeout(1.0)
 
     local_ip = get_local_ip()
-    print(f"Server listening on port {port}")
-    print(f"Server IP address: {local_ip}")
+    ui.message(f"Server listening on port {port}")
+    ui.message(f"Server IP address: {local_ip}")
     if port != DEFAULT_PORT:
         client_cmd = f"python wifile.py client --host {local_ip} --port {port}"
     else:
         client_cmd = f"python wifile.py client --host {local_ip}"
-    print(f"Clients can connect using: {client_cmd}")
+    ui.message(f"Clients can connect using: {client_cmd}")
     print_ready()
-    print("Waiting for connection...")
-    print("Press Ctrl+C to stop the server.")
+    ui.message("Waiting for connection...")
+    ui.message("Press Ctrl+C to stop the server.")
 
     try:
-        while True:
+        while not ui.should_stop():
             conn = None
             try:
-                conn, addr = server_socket.accept()
+                try:
+                    conn, addr = server_socket.accept()
+                except socket.timeout:
+                    continue
                 conn.settimeout(30)  # 30 second timeout
-                print(f"\nConnected by {addr}")
+                ui.message(f"\nConnected by {addr}")
 
                 if batch_mode:
                     # Tell the client how many files to expect
                     send_frame(conn, KIND_BATCH, struct.pack(">I", len(files)))
                     for display_name, abs_path in files:
-                        if not send_one_file(conn, display_name, abs_path):
-                            print("Transfer stopped.")
+                        if not send_one_file(conn, display_name, abs_path, ui=ui):
+                            ui.message("Transfer stopped.")
                             break
                     else:
                         send_frame(conn, KIND_DONE)
-                        print(f"All {len(files)} file(s) sent successfully.")
+                        ui.message(f"All {len(files)} file(s) sent successfully.")
                 else:
                     display_name, abs_path = files[0]
-                    send_one_file(conn, display_name, abs_path)
+                    send_one_file(conn, display_name, abs_path, ui=ui)
             except (socket.error, OSError, IOError, ValueError) as e:
                 if "10054" in str(e) or "forcibly closed" in str(e).lower():
-                    print(f"\nClient disconnected unexpectedly: {e}")
+                    ui.message(f"\nClient disconnected unexpectedly: {e}")
                     disconnect_msg = (
                         "This usually means the client closed the connection "
                         "or network was interrupted."
                     )
-                    print(disconnect_msg)
+                    ui.message(disconnect_msg)
                 else:
-                    print(f"Server error: {e}")
+                    ui.message(f"Server error: {e}")
             finally:
                 if conn is not None:
                     conn.close()
 
             # After each round, ask the operator what to serve next.
-            next_target = prompt_next_target(files, batch_mode, source)
+            next_target = prompt_next_target(files, batch_mode, source, ui=ui)
             if next_target is None:
-                print("Server stopped by user.")
+                ui.message("Server stopped by user.")
                 break
             files, batch_mode, source = next_target
             print_ready()
-            print("Waiting for next connection... (Ctrl+C to stop)")
+            ui.message("Waiting for next connection... (Ctrl+C to stop)")
     except KeyboardInterrupt:
-        print("\nServer stopped by user.")
+        ui.message("\nServer stopped by user.")
     finally:
         server_socket.close()
 
@@ -440,6 +546,8 @@ def receive_one_file(
     auto_overwrite: bool,
     auto_rename: bool,
     header_payload: bytes,
+    *,
+    ui: UI | None = None,
 ) -> str:
     """Receive one file given its already-read KIND_FILE header payload.
 
@@ -452,6 +560,9 @@ def receive_one_file(
         "file"      - handled (success or failure is reported over the wire)
         "cancelled" - the user chose to cancel this transfer
     """
+    if ui is None:
+        ui = ConsoleUI()
+
     try:
         name_bytes, size_bytes = header_payload.split(b"\x00", 1)
         filename = name_bytes.decode("utf-8")
@@ -461,7 +572,7 @@ def receive_one_file(
 
     safe_name = sanitize_relative_path(filename)
     if safe_name != filename:
-        print(f"Warning: Path sanitized from '{filename}' to '{safe_name}'")
+        ui.message(f"Warning: Path sanitized from '{filename}' to '{safe_name}'")
 
     output_path = os.path.join(output_dir, safe_name)
 
@@ -474,7 +585,7 @@ def receive_one_file(
         resolved_path == resolved_output
         or resolved_path.startswith(resolved_output + os.sep)
     ):
-        print(
+        ui.message(
             f"Warning: path '{safe_name}' resolves outside the output "
             f"directory '{output_dir}'; rejecting the transfer."
         )
@@ -492,7 +603,7 @@ def receive_one_file(
     # starts streaming while the user is still deciding.
     if os.path.exists(output_path):
         if auto_overwrite:
-            print(f"Overwriting existing file '{safe_name}'...")
+            ui.message(f"Overwriting existing file '{safe_name}'...")
         elif auto_rename:
             base_name, ext = os.path.splitext(os.path.basename(output_path))
             counter = 1
@@ -502,50 +613,46 @@ def receive_one_file(
                 if not os.path.exists(new_output_path):
                     output_path = new_output_path
                     new_rel = os.path.relpath(output_path, output_dir)
-                    print(f"Saving as '{new_rel}' to avoid conflict...")
+                    ui.message(f"Saving as '{new_rel}' to avoid conflict...")
                     break
                 counter += 1
         else:
-            print(f"Warning: File '{safe_name}' already exists in '{output_dir}'")
-            while True:
-                choice = (
-                    input("Choose action: (o)verwrite, (r)ename, (c)ancel: ")
-                    .lower()
-                    .strip()
-                )
-                if choice in ["o", "overwrite"]:
-                    print(f"Overwriting existing file '{safe_name}'...")
-                    break
-                elif choice in ["r", "rename"]:
-                    base_name, ext = os.path.splitext(os.path.basename(output_path))
-                    counter = 1
-                    while True:
-                        new_filename = f"{base_name}_{counter}{ext}"
-                        new_output_path = os.path.join(output_parent, new_filename)
-                        if not os.path.exists(new_output_path):
-                            output_path = new_output_path
-                            new_rel = os.path.relpath(output_path, output_dir)
-                            print(f"Saving as '{new_rel}' instead...")
-                            break
-                        counter += 1
-                    break
-                elif choice in ["c", "cancel"]:
-                    print("Transfer cancelled by user.")
-                    # Tell the server to stop; it will not stream content.
-                    try:
-                        send_frame(client_socket, KIND_RESULT, b"\x01")
-                    except (socket.error, OSError):
-                        pass
-                    return "cancelled"
-                else:
-                    print("Invalid choice. Please enter 'o', 'r', or 'c'.")
+            ui.message(f"Warning: File '{safe_name}' already exists in '{output_dir}'")
+            choice = ui.choose(
+                "Choose action: (o)verwrite, (r)ename, (c)ancel: ",
+                ["o", "overwrite", "r", "rename", "c", "cancel"],
+                "o",
+                "Invalid choice. Please enter 'o', 'r', or 'c'.",
+            )
+            if choice in ("o", "overwrite"):
+                ui.message(f"Overwriting existing file '{safe_name}'...")
+            elif choice in ("r", "rename"):
+                base_name, ext = os.path.splitext(os.path.basename(output_path))
+                counter = 1
+                while True:
+                    new_filename = f"{base_name}_{counter}{ext}"
+                    new_output_path = os.path.join(output_parent, new_filename)
+                    if not os.path.exists(new_output_path):
+                        output_path = new_output_path
+                        new_rel = os.path.relpath(output_path, output_dir)
+                        ui.message(f"Saving as '{new_rel}' instead...")
+                        break
+                    counter += 1
+            else:
+                ui.message("Transfer cancelled by user.")
+                # Tell the server to stop; it will not stream content.
+                try:
+                    send_frame(client_socket, KIND_RESULT, b"\x01")
+                except (socket.error, OSError):
+                    pass
+                return "cancelled"
 
     # The decision is made: acknowledge and start streaming.
     send_frame(client_socket, KIND_ACK)
 
     # Receive into a temporary file, then atomically replace the destination
     # only after the full transfer and clean close succeed.
-    print(f"Receiving '{safe_name}' ({format_bytes(filesize)})...")
+    ui.message(f"Receiving '{safe_name}' ({format_bytes(filesize)})...")
     received = 0
     start_time = time.time()
     temp_path = f"{output_path}.wifile-part"
@@ -558,15 +665,15 @@ def receive_one_file(
                 chunk = recv_exact(client_socket, min(1024, filesize - received))
                 f.write(chunk)
                 received += len(chunk)
-                show_progress(received, filesize, start_time)
+                ui.progress(received, filesize, start_time)
         # The whole file arrived and the temp file closed cleanly.
         if received == filesize:
             os.replace(temp_path, output_path)
             success = True
     except (socket.error, OSError, ConnectionError) as e:
-        print(f"\nError while receiving '{safe_name}': {e}")
+        ui.message(f"\nError while receiving '{safe_name}': {e}")
         received_msg = f"Received: {format_bytes(received)} of {format_bytes(filesize)}"
-        print(received_msg)
+        ui.message(received_msg)
     finally:
         if os.path.exists(temp_path):
             try:
@@ -580,46 +687,45 @@ def receive_one_file(
         pass
 
     if success:
-        print(f"File '{safe_name}' received and saved to '{output_path}'.")
+        ui.message(f"File '{safe_name}' received and saved to '{output_path}'.")
     else:
-        print(f"Transfer incomplete. File '{output_path}' was not saved.")
+        ui.message(f"Transfer incomplete. File '{output_path}' was not saved.")
     return "file"
 
 
-def prompt_next_output(output_dir: str) -> str | None:
+def prompt_next_output(output_dir: str, *, ui: UI | None = None) -> str | None:
     """Ask the client operator what to do after a download.
 
     Returns the output directory for the next round, or None to exit the
     client.
     """
+    if ui is None:
+        ui = ConsoleUI()
     try:
         while True:
-            choice = (
-                input(
-                    "\nChoose next action: "
-                    "(c)ontinue in current location, "
-                    "(n)ew output location, (e)xit: "
-                )
-                .strip()
-                .lower()
+            choice = ui.choose(
+                "\nChoose next action: "
+                "(c)ontinue in current location, "
+                "(n)ew output location, (e)xit: ",
+                ["c", "continue", "same", "n", "new", "e", "exit", "q", "quit"],
+                "c",
+                "Invalid choice. Enter 'c', 'n', or 'e'.",
             )
             if choice in ("c", "continue", "same"):
                 return output_dir
             if choice in ("e", "exit", "q", "quit"):
                 return None
-            if choice in ("n", "new"):
-                new_dir = input("Enter new output directory: ").strip().strip('"')
-                if not new_dir:
-                    print("Invalid: directory path cannot be empty.")
-                    continue
-                try:
-                    os.makedirs(new_dir, exist_ok=True)
-                except OSError as e:
-                    print(f"Error: cannot use '{new_dir}': {e}")
-                    continue
-                print(f"Saving to '{new_dir}'.")
-                return new_dir
-            print("Invalid choice. Enter 'c', 'n', or 'e'.")
+            new_dir = ui.ask_text("Enter new output directory: ")
+            if not new_dir:
+                ui.message("Invalid: directory path cannot be empty.")
+                continue
+            try:
+                os.makedirs(new_dir, exist_ok=True)
+            except OSError as e:
+                ui.message(f"Error: cannot use '{new_dir}': {e}")
+                continue
+            ui.message(f"Saving to '{new_dir}'.")
+            return new_dir
     except EOFError:
         return None
 
@@ -630,6 +736,8 @@ def receive_batch(
     auto_overwrite: bool,
     auto_rename: bool,
     batch_payload: bytes,
+    *,
+    ui: UI | None = None,
 ) -> None:
     """Receive a batch of files until KIND_DONE, validating completion.
 
@@ -638,11 +746,13 @@ def receive_batch(
     files received matches the announced count. Unexpected frame kinds and
     files beyond the announced count abort the batch with an error message.
     """
+    if ui is None:
+        ui = ConsoleUI()
     try:
         total = struct.unpack(">I", batch_payload)[0]
     except struct.error:
         total = 0
-    print(f"Receiving batch of {total} file(s)...")
+    ui.message(f"Receiving batch of {total} file(s)...")
     received_count = 0
     cancelled = False
     done = False
@@ -652,7 +762,7 @@ def receive_batch(
             done = True
             break
         if kind != KIND_FILE or received_count >= total:
-            print(f"Unexpected message from server: {kind!r}")
+            ui.message(f"Unexpected message from server: {kind!r}")
             break
         result = receive_one_file(
             client_socket,
@@ -660,6 +770,7 @@ def receive_batch(
             auto_overwrite,
             auto_rename,
             header_payload,
+            ui=ui,
         )
         if result == "cancelled":
             cancelled = True
@@ -667,16 +778,16 @@ def receive_batch(
         received_count += 1
 
     if cancelled:
-        print("Batch transfer cancelled.")
+        ui.message("Batch transfer cancelled.")
     elif done and received_count == total:
-        print(f"Batch complete: {received_count} of {total} file(s) received.")
+        ui.message(f"Batch complete: {received_count} of {total} file(s) received.")
     elif done:
-        print(
+        ui.message(
             f"Error: server ended the batch early "
             f"({received_count} of {total} file(s) received)."
         )
     else:
-        print(
+        ui.message(
             f"Error: batch ended unexpectedly "
             f"({received_count} of {total} file(s) received)."
         )
@@ -688,6 +799,8 @@ def start_client(
     output_dir: str,
     auto_overwrite: bool = False,
     auto_rename: bool = False,
+    *,
+    ui: UI | None = None,
 ) -> None:
     """Run the client to receive a file or a batch of files from the server.
 
@@ -695,13 +808,15 @@ def start_client(
     whether to keep saving to the current output location, switch to a new
     output location, or exit. Press Ctrl+C to stop.
     """
+    if ui is None:
+        ui = ConsoleUI()
     try:
-        while True:
+        while not ui.should_stop():
             client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 client_socket.settimeout(30)  # 30 second timeout
                 client_socket.connect((host, port))
-                print(f"Connected to server {host}:{port}")
+                ui.message(f"Connected to server {host}:{port}")
 
                 first_kind, first_payload = recv_frame(client_socket)
 
@@ -712,6 +827,7 @@ def start_client(
                         auto_overwrite,
                         auto_rename,
                         first_payload,
+                        ui=ui,
                     )
                 else:
                     # Single file transfer
@@ -721,46 +837,51 @@ def start_client(
                         auto_overwrite,
                         auto_rename,
                         first_payload,
+                        ui=ui,
                     )
                     if result == "cancelled":
-                        print("Transfer cancelled.")
+                        ui.message("Transfer cancelled.")
             except (socket.error, OSError, IOError, ValueError) as e:
                 if "10054" in str(e) or "forcibly closed" in str(e).lower():
-                    print(f"Server disconnected unexpectedly: {e}")
+                    ui.message(f"Server disconnected unexpectedly: {e}")
                     disconnect_msg = (
                         "This usually means the server closed the connection "
                         "or network was interrupted."
                     )
-                    print(disconnect_msg)
+                    ui.message(disconnect_msg)
                 else:
-                    print(f"Client error: {e}")
+                    ui.message(f"Client error: {e}")
             finally:
                 client_socket.close()
 
             # After each round, ask the operator what to do next
-            next_output = prompt_next_output(output_dir)
+            next_output = prompt_next_output(output_dir, ui=ui)
             if next_output is None:
-                print("Client stopped by user.")
+                ui.message("Client stopped by user.")
                 break
             output_dir = next_output
-            print("Waiting for the next transfer... (Ctrl+C to stop)")
+            ui.message("Waiting for the next transfer... (Ctrl+C to stop)")
     except KeyboardInterrupt:
-        print("\nClient stopped by user.")
+        ui.message("\nClient stopped by user.")
 
 
-def prompt_for_source() -> tuple[str | None, str | None]:
+def prompt_for_source(*, ui: UI | None = None) -> tuple[str | None, str | None]:
     """Prompt the user for a file or folder path to send.
 
     Returns a (filepath, folder) tuple with exactly one of them set.
     Raises EOFError if input is closed before a valid path is given.
     """
+    if ui is None:
+        ui = ConsoleUI()
     while True:
-        path = input("Enter file or folder path to send: ").strip().strip('"')
+        path = ui.ask_text("Enter file or folder path to send: ")
         if os.path.isfile(path):
             return path, None
         if os.path.isdir(path):
             return None, path
-        print(f"Error: '{path}' does not exist. Enter a valid file or folder path.")
+        ui.message(
+            f"Error: '{path}' does not exist. Enter a valid file or folder path."
+        )
 
 
 def main():

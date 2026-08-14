@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>WiFile Web</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <header class="top">
+        <h1>WiFile <span class="sub">Web</span></h1>
+        <div class="conn"><span class="dot off" id="conn-dot"></span><span id="conn-label">connecting</span></div>
+    </header>
+
+    <main class="grid">
+
+        <!-- Send -->
+        <section class="pane" id="pane-server">
+            <div class="pane-head">
+                <h2>Send</h2><span class="tag">sender</span>
+            </div>
+
+            <div class="drop" id="server-drop">
+                <p>Drop files or a folder here</p>
+                <div class="drop-actions">
+                    <button type="button" class="btn ghost" id="server-pick-files-btn">Choose files</button>
+                    <button type="button" class="btn ghost" id="server-pick-folder-btn">Choose folder</button>
+                </div>
+                <input type="file" id="server-pick-files" multiple hidden>
+                <input type="file" id="server-pick-folder" webkitdirectory hidden>
+            </div>
+
+            <div class="row">
+                <label class="field grow">Source
+                    <input id="server-source" placeholder="File or folder path on this machine">
+                </label>
+                <label class="field slim">Port
+                    <input id="server-port" type="number" min="1" max="65535" value="12345">
+                </label>
+            </div>
+
+            <div class="actions">
+                <button type="button" class="btn primary" id="server-start">Start sending</button>
+                <button type="button" class="btn danger" id="server-stop" disabled>Stop</button>
+            </div>
+
+            <div class="status" id="server-status">Idle</div>
+            <div class="progress">
+                <div class="bar" id="server-bar"></div>
+            </div>
+            <div class="meta" id="server-meta"></div>
+
+            <div class="prompt" id="server-prompt" hidden>
+                <div class="prompt-text" id="server-prompt-text"></div>
+                <div class="prompt-controls" id="server-prompt-controls"></div>
+            </div>
+
+            <ul class="files" id="server-files" hidden></ul>
+
+            <div class="log" id="server-log"></div>
+        </section>
+
+        <!-- Receive -->
+        <section class="pane" id="pane-client">
+            <div class="pane-head">
+                <h2>Receive</h2><span class="tag">receiver</span>
+            </div>
+
+            <div class="row">
+                <label class="field grow">Server address
+                    <input id="client-host" placeholder="192.168.1.50">
+                </label>
+                <label class="field slim">Port
+                    <input id="client-port" type="number" min="1" max="65535" value="12345">
+                </label>
+            </div>
+
+            <label class="field">Save to
+                <input id="client-output" placeholder="Output directory (default: current)">
+            </label>
+
+            <fieldset class="conflict">
+                <legend>If a file already exists</legend>
+                <label><input type="radio" name="conflict" value="ask" checked> Ask me</label>
+                <label><input type="radio" name="conflict" value="overwrite"> Overwrite</label>
+                <label><input type="radio" name="conflict" value="rename"> Auto-rename</label>
+            </fieldset>
+
+            <div class="actions">
+                <button type="button" class="btn primary" id="client-start">Start receiving</button>
+                <button type="button" class="btn danger" id="client-stop" disabled>Stop</button>
+            </div>
+
+            <div class="status" id="client-status">Idle</div>
+            <div class="progress">
+                <div class="bar" id="client-bar"></div>
+            </div>
+            <div class="meta" id="client-meta"></div>
+
+            <div class="prompt" id="client-prompt" hidden>
+                <div class="prompt-text" id="client-prompt-text"></div>
+                <div class="prompt-controls" id="client-prompt-controls"></div>
+            </div>
+
+            <ul class="files" id="client-files" hidden></ul>
+
+            <div class="log" id="client-log"></div>
+        </section>
+    </main>
+
+    <div class="toast" id="toast" hidden></div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>
