@@ -2,7 +2,10 @@ services:
   wifile:
     build: .
     ports:
-      - "8765:8765" # web UI
+      # Host side 8876: port 8765 is often blocked on Windows hosts.
+      # Open http://127.0.0.1:8876 after `docker compose up -d`.
+      - "8876:8765" # web UI
       - "12345:12345" # transfer port (sender listens here)
+      - "54321:54321/udp" # discovery beacons (senders announce, receivers listen)
     volumes:
       - ./data:/data # mount files to send/receive here

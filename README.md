@@ -225,7 +225,31 @@ WiFile shows real-time transfer progress with:
 
 ## Network Discovery
 
-WiFile automatically displays the server's IP address when it starts, but you can also find it manually:
+The web UI can discover senders on your network — **both sides are opt-in
+and off by default**:
+
+- **Sender**: tick *Broadcast so receivers can find you* in the **Send**
+  pane. While sending, WiFile then broadcasts a small announcement (UDP,
+  port **54321**) every couple of seconds, containing the machine name, the
+  transfer port, and what is being sent.
+- **Receiver**: tick *Listen for senders* in the **Receive** pane. The web
+  UI then lists broadcasting senders under "Senders on this network" —
+  click **Connect** to fill in the address and start receiving.
+
+The toggles can be flipped at any time, even mid-transfer. Senders
+ disappear from the list shortly after they stop serving or stop
+ broadcasting.
+
+A few notes:
+
+- Discovery only happens between **web UIs** (`python webui.py`). The CLI
+  still shows the server IP and the client command in the terminal.
+- If your firewall asks, allow WiFile to receive UDP on port 54321
+  (sending/receiving files itself uses the TCP transfer port, default 12345).
+- Broadcasts only travel inside the local subnet (same Wi-Fi router), which
+  is exactly the network WiFile is meant for.
+
+You can also find the server IP manually:
 
 **Windows:**
 ```cmd
@@ -269,7 +293,9 @@ Then open <http://127.0.0.1:8765> in a browser. The page has two panes:
 - **Send** — drop files or a folder onto the page (or pick them), then start
   the sender. Progress, speed, ETA, and per-file status update live.
 - **Receive** — enter the sender's address and output folder. Name conflicts
-  can be answered per file or handled automatically.
+  can be answered per file or handled automatically. With *Listen for
+  senders* on, senders running on the network are listed with a one-click
+  **Connect** button (see [Network Discovery](#network-discovery)).
 
 Options:
 
@@ -287,14 +313,22 @@ The web UI is pure standard library, so it runs in a tiny container. A
 
 ```bash
 docker build -t wifile .
-docker run -d -p 8765:8765 -p 12345:12345 -v C:\path\to\files:/data wifile
+docker run -d -p 8765:8765 -p 12345:12345 -p 54321:54321/udp -v C:\path\to\files:/data wifile
 # or: docker compose up -d
 ```
 
 Notes:
 
 - **Publish both ports** — 8765 for the UI and 12345 (or your custom
-  transfer port) for sending.
+  transfer port) for sending. Publish `54321/udp` too if you want network
+  discovery to work.
+- **Discovery in Docker is limited** — UDP broadcasts stay inside the
+  container's bridge network, so a containerized UI sees the host's senders
+  only while beacons are forwarded (not typical). Peer discovery works best
+  between non-containerized web UIs on the same Wi-Fi.
+- **If 8765 is blocked on the host** (Windows port reservations), change the
+  left side of the compose mapping to another port, e.g. `8876:8765`, and
+  open `http://127.0.0.1:8876`.
 - **Mount the folders** you want to send or receive with `-v`.
 - **Peers use the host's LAN IP**, not the address the UI prints (that is
   the container's internal address).

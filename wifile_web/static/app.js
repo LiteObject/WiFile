@@ -43,6 +43,16 @@ const els = {
     dot: document.getElementById("conn-dot"),
     connLabel: document.getElementById("conn-label"),
     toast: document.getElementById("toast"),
+    peers: {
+        list: document.getElementById("peer-list"),
+        empty: document.getElementById("peers-empty"),
+        count: document.getElementById("peers-count"),
+    },
+    settings: {
+        broadcast: document.getElementById("server-broadcast"),
+        listen: document.getElementById("client-listen"),
+    },
+    broadcastHint: document.getElementById("server-broadcast-hint"),
 };
 
 let pollTimer = null;
@@ -102,6 +112,98 @@ function setConn(kind, label) {
 function render(snapshot) {
     renderPane(MODE.SERVER, snapshot.server);
     renderPane(MODE.CLIENT, snapshot.client);
+    renderSettings(snapshot.settings || {});
+    renderPeers(
+        snapshot.peers || [],
+        snapshot.client.running,
+        !!(snapshot.settings || {}).listen
+    );
+}
+
+// The opt-in discovery toggles; mirror the server's settings in the checkboxes.
+function renderSettings(settings) {
+    els.settings.broadcast.checked = !!settings.broadcast;
+    els.settings.listen.checked = !!settings.listen;
+}
+
+async function setSetting(key, value) {
+    try {
+        await api("/api/settings", { [key]: value });
+    } catch (error) {
+        toast(error.message);
+        refresh(); // re-sync the toggle with the server state
+    }
+}
+
+function bindSettings() {
+    els.settings.broadcast.addEventListener("change", () =>
+        setSetting("broadcast", els.settings.broadcast.checked)
+    );
+    els.settings.listen.addEventListener("change", () =>
+        setSetting("listen", els.settings.listen.checked)
+    );
+}
+
+// Senders found on the LAN via UDP broadcast announcements.
+function renderPeers(peers, receiving, listening) {
+    const list = els.peers.list;
+    list.replaceChildren();
+    list.hidden = !listening || peers.length === 0;
+    els.peers.empty.hidden = listening && peers.length > 0;
+    els.peers.empty.textContent = listening
+        ? "No senders found yet. When someone starts sending from WiFile on this network, they appear here."
+        : "Turn on \u201cListen for senders\u201d to discover WiFile senders on this network.";
+    els.peers.count.textContent = listening
+        ? peers.length
+            ? peers.length + " found"
+            : "listening…"
+        : "off";
+
+    for (const peer of peers) {
+        const item = document.createElement("li");
+        item.className = "peer";
+
+        const info = document.createElement("div");
+        info.className = "peer-info";
+
+        const name = document.createElement("div");
+        name.className = "peer-name";
+        if (peer.web_port) {
+            const link = document.createElement("a");
+            link.href = "http://" + peer.host + ":" + peer.web_port + "/";
+            link.target = "_blank";
+            link.rel = "noopener";
+            link.textContent = peer.name;
+            name.append(link);
+        } else {
+            name.textContent = peer.name;
+        }
+        const endpoint = document.createElement("span");
+        endpoint.className = "peer-endpoint";
+        endpoint.textContent = peer.host + ":" + peer.port;
+        name.append(endpoint);
+
+        const source = document.createElement("div");
+        source.className = "peer-source";
+        source.textContent = peer.source || "sending files";
+        info.append(name, source);
+
+        const connect = document.createElement("button");
+        connect.type = "button";
+        connect.className = "btn primary peer-connect";
+        connect.textContent = "Connect";
+        connect.disabled = receiving;
+        connect.addEventListener("click", () => connectPeer(peer));
+
+        item.append(info, connect);
+        list.append(item);
+    }
+}
+
+function connectPeer(peer) {
+    els.client.host.value = peer.host;
+    els.client.port.value = String(peer.port);
+    startClient();
 }
 
 function renderPane(mode, slot) {
@@ -125,6 +227,9 @@ function renderPane(mode, slot) {
     });
     if (mode === MODE.SERVER) {
         ui.drop.classList.toggle("disabled", slot.running);
+        els.broadcastHint.hidden = !(
+            slot.running && !els.settings.broadcast.checked
+        );
     }
     watchForStartFailure(mode, slot);
 
@@ -516,6 +621,7 @@ document.addEventListener("DOMContentLoaded", () => {
     els.server.stop.addEventListener("click", stopServer);
     els.client.start.addEventListener("click", startClient);
     els.client.stop.addEventListener("click", stopClient);
+    bindSettings();
 
     els.server.source.addEventListener("keydown", (event) => {
         if (event.key === "Enter") startServer();
