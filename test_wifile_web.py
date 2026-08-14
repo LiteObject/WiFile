@@ -18,6 +18,7 @@ import unittest
 from unittest import mock
 
 import wifile
+from webui import bind_server
 from wifile_web.adapter import WebUI
 from wifile_web.server import create_server, parse_upload
 from wifile_web.state import WebState
@@ -431,6 +432,33 @@ class ServerApiTest(unittest.TestCase):
             self.assertIn("version", snapshot)
         finally:
             sock.close()
+
+
+class WebUiEntryTest(unittest.TestCase):
+    """webui.py port handling: falling back when a port is taken."""
+
+    def test_bind_server_uses_ephemeral_port(self):
+        server, error = bind_server("127.0.0.1", 0)
+        try:
+            self.assertIsNone(error)
+            self.assertGreater(server.server_address[1], 0)
+        finally:
+            server.server_close()
+
+    def test_bind_server_falls_back_when_port_taken(self):
+        blocker = socket.socket()
+        blocker.bind(("127.0.0.1", 0))
+        blocker.listen(1)
+        taken_port = blocker.getsockname()[1]
+        try:
+            server, error = bind_server("127.0.0.1", taken_port)
+            try:
+                self.assertIsNotNone(error)
+                self.assertNotEqual(server.server_address[1], taken_port)
+            finally:
+                server.server_close()
+        finally:
+            blocker.close()
 
 
 if __name__ == "__main__":

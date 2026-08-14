@@ -276,6 +276,10 @@ Options:
 - `--port` — web UI port (default: 8765)
 - `--host` — bind address (default: `127.0.0.1`)
 
+If the requested port is unavailable (common on Windows, where some ports
+are reserved by the system), WiFile automatically falls back to a free port
+and prints the actual address.
+
 > ⚠️ The web UI binds to localhost by default. With `--host 0.0.0.0`, anyone
 > who can reach the page can make this machine send arbitrary local files —
 > there is no authentication. Only expose it on trusted networks.
