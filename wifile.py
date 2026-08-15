@@ -116,19 +116,24 @@ class UI(Protocol):
     can end a persistent server/client without Ctrl+C.
     """
 
-    def message(self, text: str) -> None: ...
+    def message(self, text: str) -> None:
+        """Show a plain message to the operator."""
 
     def progress(
         self, current: float, total: float, start_time: float | None = None
-    ) -> None: ...
+    ) -> None:
+        """Report transfer progress (current/total bytes, optional start time)."""
 
     def choose(
         self, prompt: str, options: Sequence[str], default: str, invalid: str
-    ) -> str: ...
+    ) -> str:
+        """Ask the operator to pick one of ``options`` and return it."""
 
-    def ask_text(self, prompt: str) -> str: ...
+    def ask_text(self, prompt: str) -> str:
+        """Ask the operator for free-form text and return it."""
 
-    def should_stop(self) -> bool: ...
+    def should_stop(self) -> bool:
+        """Return True when the operator wants the engine to stop."""
 
 
 class ConsoleUI:
@@ -141,16 +146,19 @@ class ConsoleUI:
     """
 
     def message(self, text: str) -> None:
+        """Print the message to the console."""
         print(text)
 
     def progress(
         self, current: float, total: float, start_time: float | None = None
     ) -> None:
+        """Render a progress bar to the console."""
         show_progress(current, total, start_time)
 
     def choose(
         self, prompt: str, options: Sequence[str], default: str, invalid: str
     ) -> str:
+        """Prompt on the console until a valid option is entered."""
         del default  # the console never auto-selects; only non-console UIs use it
         while True:
             choice = input(prompt).strip().lower()
@@ -159,9 +167,11 @@ class ConsoleUI:
             print(invalid)
 
     def ask_text(self, prompt: str) -> str:
+        """Read a line of free-form text from the console."""
         return input(prompt).strip().strip('"')
 
     def should_stop(self) -> bool:
+        """The console never requests a stop (Ctrl+C handles it)."""
         return False
 
 

@@ -12,7 +12,7 @@ no authentication is provided.
 import argparse
 from typing import Any
 
-from wifile_web.server import WEB_PORT, create_server
+from wifile_web.server import WEB_PORT, create_server, get_net_addresses
 
 
 def bind_server(host: str, port: int) -> tuple[Any, OSError | None]:
@@ -32,6 +32,7 @@ def bind_server(host: str, port: int) -> tuple[Any, OSError | None]:
 
 
 def main() -> None:
+    """Parse arguments, start the web server, and run it until Ctrl+C."""
     parser = argparse.ArgumentParser(description="WiFile web UI")
     parser.add_argument(
         "--port", type=int, default=WEB_PORT, help=f"Web UI port (default: {WEB_PORT})"
@@ -55,6 +56,9 @@ def main() -> None:
         print(f"Warning: could not bind port {args.port} ({bind_error}).")
         print(f"Using a free port instead: {actual_port}")
     print(f"WiFile web UI running at http://{args.host}:{actual_port}")
+    if args.host in ("0.0.0.0", "::", ""):
+        for ip in get_net_addresses():
+            print(f"  LAN: http://{ip}:{actual_port}")
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()

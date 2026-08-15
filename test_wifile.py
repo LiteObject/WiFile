@@ -21,6 +21,8 @@ import wifile
 
 
 class FrameProtocolTest(unittest.TestCase):
+    """Tests for the framed wire protocol primitives."""
+
     def test_frame_roundtrip_with_hostile_payload(self):
         """Colons, newlines and binary bytes must survive framing intact."""
         left, right = socket.socketpair()
@@ -60,6 +62,7 @@ class FrameProtocolTest(unittest.TestCase):
             right.close()
 
     def test_eof_raises_connection_error(self):
+        """A closed peer during a frame read raises ConnectionError."""
         left, right = socket.socketpair()
         left.close()
         with self.assertRaises(ConnectionError):
@@ -68,7 +71,10 @@ class FrameProtocolTest(unittest.TestCase):
 
 
 class CollectFilesTest(unittest.TestCase):
+    """Tests for recursively collecting files from a folder."""
+
     def test_recursive_collection_preserves_relative_paths(self):
+        """Nested files keep their relative paths when collected."""
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "sub", "deep"))
             for rel in ["a.txt", "sub/b.txt", "sub/deep/c.txt"]:
@@ -80,12 +86,16 @@ class CollectFilesTest(unittest.TestCase):
 
 
 class FileTransferTest(unittest.TestCase):
+    """Tests for single-file send/receive over a socketpair."""
+
     def setUp(self):
+        """Reset result holders before each test."""
         self.send_result: bool | None = None
         self.send_error: Exception | None = None
         self.server_result: tuple[bytes, bytes] | None = None
 
     def _run_send(self, sock, name, path):
+        """Call send_one_file in a thread, capturing success or error."""
         try:
             self.send_result = wifile.send_one_file(sock, name, path)
         except (OSError, ValueError) as e:  # failure path
@@ -257,24 +267,32 @@ class FileTransferTest(unittest.TestCase):
             real_open = builtins.open
 
             class FailingFile:
+                """A file wrapper whose close always raises OSError."""
+
                 def __init__(self, f):
+                    """Wrap the real file object."""
                     self._f = f
 
                 def write(self, chunk):
+                    """Write through to the wrapped file."""
                     return self._f.write(chunk)
 
                 def close(self):
+                    """Close the wrapped file, then raise a simulated failure."""
                     self._f.close()
                     raise OSError("simulated close failure")
 
                 def __enter__(self):
+                    """Return self as the context manager."""
                     return self
 
                 def __exit__(self, *exc):
+                    """Close on exit and propagate the failure."""
                     self.close()
                     return False
 
             def fake_open(path, mode, *args, **kwargs):
+                """Wrap every open call with FailingFile."""
                 return FailingFile(real_open(path, mode, *args, **kwargs))
 
             t = threading.Thread(
@@ -320,30 +338,37 @@ class FileTransferTest(unittest.TestCase):
 
 
 class SanitizePathTest(unittest.TestCase):
+    """Tests for sanitize_relative_path keeping names inside output_dir."""
+
     def test_removes_parent_traversal(self):
+        """Parent traversal components are stripped."""
         self.assertEqual(
             wifile.sanitize_relative_path("../../etc/passwd"),
             os.path.join("etc", "passwd"),
         )
 
     def test_normalizes_separators(self):
+        """Backslash separators are normalized to native ones."""
         self.assertEqual(
             wifile.sanitize_relative_path("a\\b\\c.txt"),
             os.path.join("a", "b", "c.txt"),
         )
 
     def test_absolute_path_is_relativized(self):
+        """Absolute paths are converted to relative names."""
         self.assertEqual(
             wifile.sanitize_relative_path("/etc/passwd"),
             os.path.join("etc", "passwd"),
         )
 
     def test_empty_becomes_unnamed(self):
+        """Empty or root-only paths fall back to 'unnamed'."""
         self.assertEqual(wifile.sanitize_relative_path(""), "unnamed")
         self.assertEqual(wifile.sanitize_relative_path("/"), "unnamed")
 
     @unittest.skipUnless(os.name == "nt", "Windows drive handling")
     def test_drive_qualified_component_is_stripped(self):
+        """A leading drive-qualified component is stripped."""
         self.assertEqual(wifile.sanitize_relative_path("C:/outside.txt"), "outside.txt")
         self.assertEqual(
             wifile.sanitize_relative_path("C:\\outside.txt"), "outside.txt"
@@ -382,17 +407,20 @@ class PromptNextTargetTest(unittest.TestCase):
     """Persistent server: choosing the same target, switching, or quitting."""
 
     def test_same_target_returns_current(self):
+        """Choosing 's' keeps serving the current target."""
         files = [("a.txt", "/abs/a.txt")]
         with mock.patch("builtins.input", return_value="s"):
             result = wifile.prompt_next_target(files, False, "/abs/a.txt")
         self.assertEqual(result, (files, False, "/abs/a.txt"))
 
     def test_exit_returns_none(self):
+        """Choosing 'e' stops the persistent server."""
         with mock.patch("builtins.input", return_value="e"):
             result = wifile.prompt_next_target([("a.txt", "/a")], False, "/a")
         self.assertIsNone(result)
 
     def test_switch_to_new_file(self):
+        """Choosing 'n' and a file path serves that file next."""
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "new.txt")
             with open(path, "w", encoding="utf-8") as f:
@@ -406,6 +434,7 @@ class PromptNextTargetTest(unittest.TestCase):
             self.assertEqual(files, [(os.path.basename(path), path)])
 
     def test_switch_to_new_folder(self):
+        """Choosing 'n' and a folder serves that folder as a batch."""
         with tempfile.TemporaryDirectory() as tmp:
             sub = os.path.join(tmp, "sub")
             os.makedirs(sub)
@@ -427,6 +456,7 @@ class PromptNextTargetTest(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_invalid_choice_repeats_prompt(self):
+        """An invalid choice re-prompts until a valid one is given."""
         with mock.patch("builtins.input", side_effect=["x", "e"]):
             result = wifile.prompt_next_target([("a.txt", "/a")], False, "/a")
         self.assertIsNone(result)
@@ -442,16 +472,19 @@ class PromptNextOutputTest(unittest.TestCase):
     """Persistent client: keeping, switching, or quitting the output dir."""
 
     def test_continue_returns_same_dir(self):
+        """Choosing 'c' keeps the current output directory."""
         with mock.patch("builtins.input", return_value="c"):
             result = wifile.prompt_next_output("/tmp/out")
         self.assertEqual(result, "/tmp/out")
 
     def test_exit_returns_none(self):
+        """Choosing 'e' stops the persistent client."""
         with mock.patch("builtins.input", return_value="e"):
             result = wifile.prompt_next_output("/tmp/out")
         self.assertIsNone(result)
 
     def test_new_dir_is_created_and_returned(self):
+        """Choosing 'n' and a path creates and returns that directory."""
         with tempfile.TemporaryDirectory() as tmp:
             new_dir = os.path.join(tmp, "newout")
             with mock.patch("builtins.input", side_effect=["n", new_dir]):
@@ -470,6 +503,7 @@ class PromptNextOutputTest(unittest.TestCase):
             self.assertIsNone(result)
 
     def test_eof_returns_none(self):
+        """EOF (Ctrl+D) must end the persistent client cleanly."""
         with mock.patch("builtins.input", side_effect=EOFError):
             result = wifile.prompt_next_output("/tmp/out")
         self.assertIsNone(result)
@@ -479,6 +513,7 @@ class BatchProtocolTest(unittest.TestCase):
     """The framed batch flow: KIND_BATCH -> per-file handshake -> KIND_DONE."""
 
     def test_batch_transfers_multiple_files_with_subfolders(self):
+        """A full batch with nested files arrives intact."""
         left, right = socket.socketpair()
         with tempfile.TemporaryDirectory() as tmp:
             sources: dict[str, str] = {}
@@ -495,6 +530,7 @@ class BatchProtocolTest(unittest.TestCase):
             errors: list[str] = []
 
             def server():
+                """Play the server side: batch frame, files, then done."""
                 try:
                     wifile.send_frame(
                         left, wifile.KIND_BATCH, struct.pack(">I", len(sources))
@@ -545,6 +581,7 @@ class BatchProtocolTest(unittest.TestCase):
             errors: list[str] = []
 
             def server():
+                """Play the server side and close on cancellation."""
                 try:
                     wifile.send_frame(left, wifile.KIND_BATCH, struct.pack(">I", 2))
                     wifile.send_one_file(left, "one.txt", os.path.join(tmp, "one.txt"))
@@ -587,6 +624,8 @@ class BatchProtocolTest(unittest.TestCase):
 
 
 class ServerMessageTest(unittest.TestCase):
+    """Tests for the informational messages the server prints."""
+
     def test_custom_port_included_in_client_command(self):
         """A server on a custom port must tell clients to pass --port."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -600,6 +639,7 @@ class ServerMessageTest(unittest.TestCase):
             probe.close()
 
             def client():
+                """Play one client round against the running server."""
                 c = socket.socket()
                 c.settimeout(5)
                 c.connect(("127.0.0.1", port))
@@ -648,10 +688,12 @@ class BatchValidationTest(unittest.TestCase):
         wifile.recv_frame(left)  # RESULT
 
     def test_successful_batch_reports_complete(self):
+        """A complete batch is reported as 'Batch complete'."""
         left, right = socket.socketpair()
         with tempfile.TemporaryDirectory() as tmp:
 
             def server():
+                """Serve one file then send KIND_DONE."""
                 try:
                     self._serve_one_file(left, "a.txt", b"hi")
                     wifile.send_frame(left, wifile.KIND_DONE)
@@ -709,6 +751,7 @@ class BatchValidationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
 
             def server():
+                """Serve one file plus an unannounced second file."""
                 try:
                     self._serve_one_file(left, "a.txt", b"hi")
                     # Second, unannounced file (the batch announced only 1).

@@ -15,6 +15,8 @@ const els = {
         stop: document.getElementById("server-stop"),
         source: document.getElementById("server-source"),
         port: document.getElementById("server-port"),
+        addr: document.getElementById("server-addr"),
+        addrList: document.getElementById("server-addr-list"),
         drop: document.getElementById("server-drop"),
         status: document.getElementById("server-status"),
         bar: document.getElementById("server-bar"),
@@ -47,6 +49,7 @@ const els = {
 
 let pollTimer = null;
 let toastTimer = null;
+let netAddresses = [];
 const lastLogLen = { server: 0, client: 0 };
 const failToasted = { server: false, client: false };
 
@@ -302,6 +305,68 @@ function renderLog(log, ui) {
 }
 
 // ---------------------------------------------------------------------------
+// LAN address display (so the sender can tell receivers what to enter)
+// ---------------------------------------------------------------------------
+
+function serverAddrPort() {
+    const port = parseInt(els.server.port.value, 10);
+    return Number.isNaN(port) ? "" : String(port);
+}
+
+function renderServerAddr() {
+    const ui = els.server;
+    ui.addrList.replaceChildren();
+    const port = serverAddrPort();
+    const rows = netAddresses.map((ip) => ip + (port ? ":" + port : ""));
+    ui.addr.hidden = rows.length === 0;
+    for (const row of rows) {
+        const line = document.createElement("div");
+        line.className = "addr-row";
+        const code = document.createElement("code");
+        code.textContent = row;
+        const copy = document.createElement("button");
+        copy.type = "button";
+        copy.className = "btn ghost";
+        copy.textContent = "Copy";
+        copy.addEventListener("click", async () => {
+            try {
+                await navigator.clipboard.writeText(row);
+                toast("Copied " + row);
+            } catch (error) {
+                toast("Could not copy: " + error.message);
+            }
+        });
+        line.append(code, copy);
+        ui.addrList.append(line);
+    }
+}
+
+async function loadNetInfo() {
+    try {
+        const data = await api("/api/netinfo");
+        netAddresses = (data.addresses || []).filter(
+            (ip) => ip && !ip.startsWith("127.")
+        );
+    } catch (error) {
+        netAddresses = [];
+    }
+    renderServerAddr();
+}
+
+// If this page was opened from another device (not localhost), the address the
+// browser used is the server machine's address — prefill it for the receiver.
+function prefillClientHost() {
+    const host = location.hostname;
+    const loopback =
+        host === "localhost" ||
+        host === "127.0.0.1" ||
+        host === "0.0.0.0" ||
+        host === "::1" ||
+        host === "[::1]";
+    if (host && !loopback) els.client.host.value = host;
+}
+
+// ---------------------------------------------------------------------------
 // API actions
 // ---------------------------------------------------------------------------
 
@@ -524,6 +589,8 @@ document.addEventListener("DOMContentLoaded", () => {
         if (event.key === "Enter") startClient();
     });
 
+    els.server.port.addEventListener("input", renderServerAddr);
+
     bindDrop(els.server.drop);
     bindPicker(
         document.getElementById("server-pick-files-btn"),
@@ -538,4 +605,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
     refresh();
     connect();
+    loadNetInfo();
+    prefillClientHost();
 });

@@ -267,7 +267,9 @@ python webui.py
 Then open <http://127.0.0.1:8765> in a browser. The page has two panes:
 
 - **Send** — drop files or a folder onto the page (or pick them), then start
-  the sender. Progress, speed, ETA, and per-file status update live.
+  the sender. Progress, speed, ETA, and per-file status update live. The pane
+  also shows the address receivers should connect to (e.g. `192.168.1.50:12345`)
+  with a copy button, so you always know what to tell the other device.
 - **Receive** — enter the sender's address and output folder. Name conflicts
   can be answered per file or handled automatically.
 
@@ -279,6 +281,11 @@ Options:
 If the requested port is unavailable (common on Windows, where some ports
 are reserved by the system), WiFile automatically falls back to a free port
 and prints the actual address.
+
+When you bind to a non-loopback address (`--host 0.0.0.0`), the console also
+prints the page's LAN URLs (e.g. `http://192.168.1.50:8765`), so you can open
+the UI from another device — the Receive pane then has the sender's address
+pre-filled for you.
 
 > ⚠️ The web UI binds to localhost by default. With `--host 0.0.0.0`, anyone
 > who can reach the page can make this machine send arbitrary local files —

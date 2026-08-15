@@ -23,16 +23,19 @@ class WebUI:
     """UI implementation that forwards engine events into a WebState slot."""
 
     def __init__(self, state: WebState, mode: str) -> None:
+        """Bind the adapter to a state store slot ("server" or "client")."""
         self._state = state
         self._mode = mode
         self._last_progress_time = 0.0
 
     def message(self, text: str) -> None:
+        """Append a message to the slot's log."""
         self._state.log(self._mode, text)
 
     def progress(
         self, current: float, total: float, start_time: float | None = None
     ) -> None:
+        """Record progress, throttled, computing speed and ETA when possible."""
         if total <= 0:
             return
         now = time.monotonic()
@@ -53,16 +56,20 @@ class WebUI:
     def choose(
         self, prompt: str, options: Sequence[str], default: str, invalid: str
     ) -> str:
+        """Block until the browser answers, then return the chosen option."""
         del invalid  # buttons make invalid input impossible in the browser
         return self._await("choose", prompt, options, default)
 
     def ask_text(self, prompt: str) -> str:
+        """Block until the browser provides free-form text."""
         return self._await("ask_text", prompt, (), "")
 
     def should_stop(self) -> bool:
+        """Report whether a stop has been requested for the slot."""
         return self._state.is_stop_requested(self._mode)
 
     def _await(self, kind: str, text: str, options: Sequence[str], default: str) -> str:
+        """Register a prompt and wait for its answer (or a timeout)."""
         reply: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=1)
         prompt_id = self._state.create_prompt(
             self._mode, kind, text, options, default, reply

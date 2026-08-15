@@ -20,6 +20,8 @@ MODES = ("server", "client")
 
 
 class _PendingPrompt:
+    """A prompt waiting for an answer from the HTTP layer."""
+
     __slots__ = ("id", "kind", "text", "options", "default", "reply")
 
     def __init__(
@@ -31,6 +33,7 @@ class _PendingPrompt:
         default: str,
         reply: queue.Queue[tuple[str, str | None]],
     ) -> None:
+        """Store the prompt fields and its answer queue."""
         self.id = prompt_id
         self.kind = kind  # "choose" or "ask_text"
         self.text = text
@@ -40,7 +43,10 @@ class _PendingPrompt:
 
 
 class _Slot:
+    """Mutable per-mode state guarded by the WebState lock."""
+
     def __init__(self, max_log_lines: int) -> None:
+        """Initialize an idle slot with an empty bounded log."""
         self.running = False
         self.stop_requested = False
         self.log: deque[str] = deque(maxlen=max_log_lines)
@@ -52,6 +58,7 @@ class WebState:
     """All shared UI state, guarded by a single lock (contention is low)."""
 
     def __init__(self, max_log_lines: int = MAX_LOG_LINES) -> None:
+        """Create server/client slots with a shared lock and condition."""
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._slots: dict[str, _Slot] = {mode: _Slot(max_log_lines) for mode in MODES}
@@ -61,10 +68,12 @@ class WebState:
     # -- mutation -------------------------------------------------------------
 
     def _bump(self) -> None:
+        """Increment the version counter and wake any SSE waiters."""
         self._version += 1
         self._cond.notify_all()
 
     def log(self, mode: str, text: str) -> None:
+        """Append a line to the mode's bounded log."""
         with self._lock:
             self._slots[mode].log.append(text)
             self._bump()
@@ -72,6 +81,7 @@ class WebState:
     def set_progress(
         self, mode: str, current: float, total: float, speed: float, eta: float
     ) -> None:
+        """Record a progress summary (percent capped at 100) for the slot."""
         with self._lock:
             percent = (current / total) * 100.0 if total > 0 else 100.0
             self._slots[mode].progress = {
@@ -84,6 +94,7 @@ class WebState:
             self._bump()
 
     def clear_progress(self, mode: str) -> None:
+        """Drop the mode's progress summary if one is set."""
         with self._lock:
             slot = self._slots[mode]
             if slot.progress is not None:
@@ -120,6 +131,7 @@ class WebState:
             return prompt_id
 
     def clear_prompt(self, mode: str, prompt_id: str) -> bool:
+        """Remove a pending prompt if it matches; returns whether it did."""
         with self._lock:
             slot = self._slots[mode]
             if slot.prompt is not None and slot.prompt.id == prompt_id:
@@ -147,6 +159,7 @@ class WebState:
         return True
 
     def set_running(self, mode: str, running: bool) -> None:
+        """Update the mode's running flag (no-op if unchanged)."""
         with self._lock:
             slot = self._slots[mode]
             if slot.running != running:
@@ -192,10 +205,12 @@ class WebState:
     # -- queries ----------------------------------------------------------------
 
     def is_stop_requested(self, mode: str) -> bool:
+        """Return whether a stop has been requested for the mode."""
         with self._lock:
             return self._slots[mode].stop_requested
 
     def is_running(self, mode: str) -> bool:
+        """Return whether the mode's engine is currently running."""
         with self._lock:
             return self._slots[mode].running
 
@@ -209,6 +224,7 @@ class WebState:
             }
 
     def _slot_snapshot(self, mode: str) -> dict[str, Any]:
+        """Build the JSON-ready snapshot for one mode's slot."""
         slot = self._slots[mode]
         prompt = None
         if slot.prompt is not None:

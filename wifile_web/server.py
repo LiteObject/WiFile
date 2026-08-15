@@ -7,6 +7,7 @@ shared :class:`WebState` store. Endpoints:
     GET  /            static SPA
     GET  /api/state   full snapshot as JSON
     GET  /api/events  Server-Sent Events stream of snapshots
+    GET  /api/netinfo machine LAN IP addresses clients can connect to
     POST /api/start   start the server or client engine thread
     POST /api/upload  multipart upload of files to serve
     POST /api/answer  answer a pending prompt
@@ -15,9 +16,12 @@ shared :class:`WebState` store. Endpoints:
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import shutil
+import socket
+import sys
 import tempfile
 import threading
 import time
@@ -49,8 +53,195 @@ _CONTENT_TYPES = {
 }
 
 
+def get_net_addresses() -> list[str]:
+    """Return the machine's LAN IPv4 addresses, primary outbound first.
+
+    The primary address (the interface used to reach the internet) is always
+    listed first. On Windows, the remaining addresses come from
+    GetAdaptersAddresses so virtual adapters (WSL, Hyper-V, Docker,
+    Bluetooth) are excluded by adapter name; elsewhere the host name is used
+    and well-known virtual ranges are filtered. Best effort: falls back to
+    ``127.0.0.1`` when nothing can be determined.
+    """
+    addresses: list[str] = []
+    primary = _primary_outbound_ip()
+    if primary:
+        addresses.append(primary)
+    if sys.platform == "win32":
+        try:
+            real = _windows_adapter_addresses()
+        except (OSError, AttributeError, ValueError):
+            real = None
+        if real is not None:
+            for ip in real:
+                if ip not in addresses:
+                    addresses.append(ip)
+            return addresses or ["127.0.0.1"]
+    for ip in _hostname_addresses():
+        if ip not in addresses:
+            addresses.append(ip)
+    return addresses or ["127.0.0.1"]
+
+
+def _primary_outbound_ip() -> str | None:
+    """Return the IP used to reach the internet, or None if unknown."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return None
+
+
+def _looks_virtual(ip: str) -> bool:
+    """Return True for addresses typically found on virtual adapters.
+
+    Matches link-local (169.254/16) and the 172.16/12 block used by many
+    Docker, WSL, and Hyper-V virtual switches. The primary outbound address
+    is exempted by the caller, so a real LAN on 172.x still shows up.
+    """
+    if ip.startswith("169.254."):
+        return True
+    parts = ip.split(".")
+    return (
+        len(parts) == 4
+        and parts[0] == "172"
+        and parts[1].isdigit()
+        and 16 <= int(parts[1]) <= 31
+    )
+
+
+def _hostname_addresses() -> list[str]:
+    """Return non-loopback IPv4 addresses the host name resolves to."""
+    addresses: list[str] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if (
+                not ip.startswith("127.")
+                and not _looks_virtual(ip)
+                and ip not in addresses
+            ):
+                addresses.append(ip)
+    except OSError:
+        pass
+    return addresses
+
+
+def _windows_adapter_addresses() -> list[str] | None:
+    """Return IPv4 addresses of physical adapters via GetAdaptersAddresses.
+
+    Returns None if the Win32 API is unavailable or fails, so callers can
+    fall back to host-name resolution. Virtual adapters (WSL, Hyper-V,
+    Docker, Bluetooth, loopback) are skipped by their friendly name.
+    """
+    from ctypes import wintypes
+
+    class _Sockaddr(ctypes.Structure):
+        """Minimal sockaddr: address family followed by address bytes."""
+
+        _fields_ = [
+            ("sa_family", ctypes.c_ushort),
+            ("sa_data", ctypes.c_ubyte * 14),
+        ]
+
+    class _SocketAddress(ctypes.Structure):
+        """SOCKET_ADDRESS: a sockaddr pointer plus its length."""
+
+        _fields_ = [
+            ("lpSockaddr", ctypes.POINTER(_Sockaddr)),
+            ("iSockaddrLength", ctypes.c_int),
+        ]
+
+    class _Unicast(ctypes.Structure):
+        """IP_ADAPTER_UNICAST_ADDRESS node (head fields only)."""
+
+        _fields_ = [
+            ("u", ctypes.c_ulonglong),  # covers the Length/Flags union
+            ("Next", ctypes.c_void_p),
+            ("Address", _SocketAddress),
+        ]
+
+    class _Adapters(ctypes.Structure):
+        """IP_ADAPTER_ADDRESSES node up to the friendly name field."""
+
+        _fields_ = [
+            ("u", ctypes.c_ulonglong),  # covers the Length/IfIndex union
+            ("Next", ctypes.c_void_p),
+            ("AdapterName", ctypes.c_char_p),
+            ("FirstUnicastAddress", ctypes.c_void_p),
+            ("FirstAnycastAddress", ctypes.c_void_p),
+            ("FirstMulticastAddress", ctypes.c_void_p),
+            ("FirstDnsServerAddress", ctypes.c_void_p),
+            ("DnsSuffix", ctypes.c_wchar_p),
+            ("Description", ctypes.c_wchar_p),
+            ("FriendlyName", ctypes.c_wchar_p),
+        ]
+
+    get_adapters = ctypes.windll.iphlpapi.GetAdaptersAddresses
+    get_adapters.restype = wintypes.DWORD
+    get_adapters.argtypes = [
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.POINTER(_Adapters),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+
+    size = wintypes.DWORD(0)
+    get_adapters(socket.AF_INET, 0, None, None, ctypes.byref(size))
+    if size.value == 0:
+        return []
+    buf = ctypes.create_string_buffer(size.value)
+    result = get_adapters(
+        socket.AF_INET,
+        0,
+        None,
+        ctypes.cast(buf, ctypes.POINTER(_Adapters)),
+        ctypes.byref(size),
+    )
+    if result != 0:  # ERROR_BUFFER_OVERFLOW: retry once with the new size
+        buf = ctypes.create_string_buffer(size.value or 15000)
+        result = get_adapters(
+            socket.AF_INET,
+            0,
+            None,
+            ctypes.cast(buf, ctypes.POINTER(_Adapters)),
+            ctypes.byref(size),
+        )
+        if result != 0:
+            return None
+
+    virtual = ("vEthernet", "WSL", "Hyper-V", "Docker", "Loopback", "Bluetooth")
+    addresses: list[str] = []
+    node = ctypes.cast(buf, ctypes.POINTER(_Adapters))
+    while node:
+        adapter = node.contents
+        name = adapter.FriendlyName or ""
+        if not any(token.lower() in name.lower() for token in virtual):
+            unicast = ctypes.cast(adapter.FirstUnicastAddress, ctypes.POINTER(_Unicast))
+            while unicast:
+                entry = unicast.contents
+                sockaddr = entry.Address.lpSockaddr
+                if sockaddr and sockaddr.contents.sa_family == socket.AF_INET:
+                    # sockaddr_in: sa_data[0:2] port, sa_data[2:6] address.
+                    ip = socket.inet_ntoa(bytes(sockaddr.contents.sa_data[2:6]))
+                    if (
+                        not ip.startswith("127.")
+                        and not _looks_virtual(ip)
+                        and ip not in addresses
+                    ):
+                        addresses.append(ip)
+                unicast = ctypes.cast(entry.Next, ctypes.POINTER(_Unicast))
+        node = ctypes.cast(adapter.Next, ctypes.POINTER(_Adapters))
+    return addresses
+
+
 class _RequestError(Exception):
+    """An HTTP error carrying a status code to send back to the client."""
+
     def __init__(self, status: int, message: str) -> None:
+        """Store the status code and message for the error response."""
         super().__init__(message)
         self.status = status
         self.message = message
@@ -60,12 +251,14 @@ class EngineRunner:
     """Starts/stops the sender and receiver engine threads."""
 
     def __init__(self, state: WebState) -> None:
+        """Track engine threads and upload batches for the shared state."""
         self._state = state
         self._threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
         self._upload_batches: set[str] = set()
 
     def start(self, mode: str, params: dict[str, Any]) -> None:
+        """Start the server or client engine thread, rejecting double starts."""
         with self._lock:
             existing = self._threads.get(mode)
             if existing is not None and existing.is_alive():
@@ -82,12 +275,14 @@ class EngineRunner:
             thread.start()
 
     def register_upload(self, batch_dir: str) -> None:
+        """Track an upload batch so it is cleaned up when the sender stops."""
         with self._lock:
             self._upload_batches.add(batch_dir)
 
     # -- engine entry points --------------------------------------------------
 
     def _run_server(self, mode: str, params: dict[str, Any]) -> None:
+        """Run the sender engine, logging failures into the state store."""
         source = str(params.get("source") or "")
         port = int(params["port"])
         try:
@@ -110,6 +305,7 @@ class EngineRunner:
             self._cleanup_uploads()
 
     def _run_client(self, mode: str, params: dict[str, Any]) -> None:
+        """Run the receiver engine, logging failures into the state store."""
         host = str(params["host"])
         port = int(params["port"])
         output_dir = str(params.get("output_dir") or ".")
@@ -188,35 +384,43 @@ def parse_upload(body: bytes, content_type: str) -> tuple[str, int]:
 
 
 class _Server(ThreadingHTTPServer):
+    """Threaded HTTP server that carries the shared state and engine runner."""
+
     daemon_threads = True
 
     def __init__(
         self, address: tuple[str, int], state: WebState, runner: EngineRunner
     ) -> None:
+        """Attach the state and runner, then bind the server."""
         self.web_state = state
         self.runner = runner
         super().__init__(address, _Handler)
 
 
 class _Handler(BaseHTTPRequestHandler):
+    """Serves the SPA and the JSON/SSE API against the shared WebState."""
+
     protocol_version = "HTTP/1.1"
     server_version = "WiFileWeb/0.1"
     close_connection: bool
 
     @property
     def state(self) -> WebState:
+        """The shared WebState attached to the server."""
         return self.server.web_state  # type: ignore[attr-defined]
 
     @property
     def runner(self) -> EngineRunner:
+        """The EngineRunner attached to the server."""
         return self.server.runner  # type: ignore[attr-defined]
 
     def log_message(self, *args: Any) -> None:
-        pass  # keep the console quiet; state changes go to the UI instead
+        """Suppress default access logs; state changes go to the UI instead."""
 
     # -- helpers ---------------------------------------------------------------
 
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+        """Send a JSON response with the given status code."""
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -225,6 +429,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_body(self) -> bytes:
+        """Read the request body up to the declared Content-Length."""
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -242,6 +447,7 @@ class _Handler(BaseHTTPRequestHandler):
         return b"".join(chunks)
 
     def _read_json(self) -> dict[str, Any]:
+        """Read and parse the request body as a JSON object."""
         raw = self._read_body()
         if not raw:
             return {}
@@ -255,13 +461,18 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- routing ------------------------------------------------------------------
 
-    def do_GET(self) -> None:  # noqa: N802 (http.server API)
+    def do_GET(
+        self,
+    ) -> None:  # noqa: N802 (http.server API)  # pylint: disable=invalid-name
+        """Route GET requests to the API, events stream, or static files."""
         try:
             path = self.path.split("?", 1)[0]
             if path == "/api/state":
                 self._send_json(200, self.state.get_snapshot())
             elif path == "/api/events":
                 self._handle_events()
+            elif path == "/api/netinfo":
+                self._handle_netinfo()
             else:
                 self._serve_static(path)
         except (BrokenPipeError, ConnectionResetError):
@@ -271,7 +482,8 @@ class _Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError) as e:
             self._send_json(500, {"error": str(e)})
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:  # noqa: N802  # pylint: disable=invalid-name
+        """Route POST requests to the API endpoints."""
         try:
             path = self.path.split("?", 1)[0]
             if path == "/api/start":
@@ -294,6 +506,7 @@ class _Handler(BaseHTTPRequestHandler):
     # -- endpoints ------------------------------------------------------------------
 
     def _handle_start(self) -> None:
+        """Validate and start a server or client engine."""
         data = self._read_json()
         mode = data.get("mode")
         if mode not in ("server", "client"):
@@ -336,6 +549,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True, "mode": mode})
 
     def _handle_stop(self) -> None:
+        """Request a stop for a server or client engine."""
         data = self._read_json()
         mode = data.get("mode")
         if mode not in ("server", "client"):
@@ -344,6 +558,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def _handle_answer(self) -> None:
+        """Deliver an answer to a pending prompt."""
         data = self._read_json()
         mode = data.get("mode")
         prompt_id = data.get("prompt_id")
@@ -356,6 +571,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def _handle_upload(self) -> None:
+        """Accept a multipart upload and register the resulting batch."""
         raw_length = self.headers.get("Content-Length")
         try:
             length = int(raw_length) if raw_length is not None else 0
@@ -372,7 +588,12 @@ class _Handler(BaseHTTPRequestHandler):
         self.runner.register_upload(batch_dir)
         self._send_json(200, {"ok": True, "source": batch_dir, "count": count})
 
+    def _handle_netinfo(self) -> None:
+        """Report the machine's LAN addresses so clients know what to enter."""
+        self._send_json(200, {"addresses": get_net_addresses()})
+
     def _handle_events(self) -> None:
+        """Stream snapshot JSON as Server-Sent Events with a heartbeat."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -392,6 +613,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
     def _serve_static(self, path: str) -> None:
+        """Serve a static file, guarding against path traversal."""
         rel = path.lstrip("/") or "index.html"
         base = _STATIC_DIR.resolve()
         target = (base / rel).resolve()

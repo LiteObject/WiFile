@@ -20,11 +20,17 @@ from unittest import mock
 import wifile
 from webui import bind_server
 from wifile_web.adapter import WebUI
-from wifile_web.server import create_server, parse_upload
+from wifile_web.server import (
+    _looks_virtual,
+    create_server,
+    get_net_addresses,
+    parse_upload,
+)
 from wifile_web.state import WebState
 
 
 def free_port() -> int:
+    """Return a free TCP port by binding to port 0 on the loopback interface."""
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
@@ -36,15 +42,18 @@ class RecordingUI:
     """Minimal UI implementation used by tests to drive wifile directly."""
 
     def __init__(self) -> None:
+        """Initialize an empty message recorder."""
         self.messages: list[str] = []
 
     def message(self, text: str) -> None:
+        """Record a UI message."""
         self.messages.append(text)
 
     def progress(self, current, total, start_time=None) -> None:
-        pass
+        """No-op progress callback; tests don't need progress output."""
 
     def choose(self, prompt, options, default, invalid) -> str:
+        """Auto-pick an option: exit, cancel, or the first available."""
         del prompt, invalid
         if "e" in options:
             return "e"
@@ -53,14 +62,19 @@ class RecordingUI:
         return options[0] if options else default
 
     def ask_text(self, prompt: str) -> str:
+        """Simulate a client that never provides free-form text."""
         raise EOFError
 
     def should_stop(self) -> bool:
+        """Never request a stop in tests."""
         return False
 
 
 class StateStoreTest(unittest.TestCase):
+    """Tests for the WebState snapshot, log, prompt, and version handling."""
+
     def test_log_is_bounded(self):
+        """The log keeps only the most recent max_log_lines entries."""
         state = WebState(max_log_lines=3)
         for i in range(5):
             state.log("server", f"line {i}")
@@ -68,6 +82,7 @@ class StateStoreTest(unittest.TestCase):
         self.assertEqual(snap["server"]["log"], ["line 2", "line 3", "line 4"])
 
     def test_prompt_create_answer_and_clear(self):
+        """Creating, answering, and clearing a prompt round-trips correctly."""
         state = WebState()
         reply: queue.Queue = queue.Queue(maxsize=1)
         prompt_id = state.create_prompt(
@@ -80,6 +95,7 @@ class StateStoreTest(unittest.TestCase):
         self.assertIsNone(state.get_snapshot()["client"]["prompt"])
 
     def test_answer_with_wrong_id_is_rejected(self):
+        """Answers with an unknown prompt id or mode are rejected."""
         state = WebState()
         reply: queue.Queue = queue.Queue(maxsize=1)
         state.create_prompt("client", "choose", "Pick", ["a"], "a", reply)
@@ -87,6 +103,7 @@ class StateStoreTest(unittest.TestCase):
         self.assertFalse(state.answer_prompt("server", "nope", "a"))
 
     def test_request_stop_unblocks_pending_prompt(self):
+        """A stop request resolves a pending prompt with the exit choice."""
         state = WebState()
         reply: queue.Queue = queue.Queue(maxsize=1)
         state.create_prompt("server", "choose", "Next?", ["s", "n", "e"], "s", reply)
@@ -96,6 +113,7 @@ class StateStoreTest(unittest.TestCase):
         self.assertIsNone(state.get_snapshot()["server"]["prompt"])
 
     def test_version_bumps_on_mutation(self):
+        """Any mutation bumps the snapshot version."""
         state = WebState()
         before = state.get_snapshot()["version"]
         state.log("client", "hello")
@@ -103,18 +121,24 @@ class StateStoreTest(unittest.TestCase):
 
 
 class AdapterTest(unittest.TestCase):
+    """Tests for the WebUI adapter driving WebState."""
+
     def setUp(self):
+        """Create a fresh WebState before each test."""
         self.state = WebState()
 
     def test_message_appends_log(self):
+        """A UI message is appended to the mode's log."""
         WebUI(self.state, "server").message("hello")
         self.assertEqual(self.state.get_snapshot()["server"]["log"], ["hello"])
 
     def test_choose_blocks_until_answered(self):
+        """choose blocks until another thread answers the prompt."""
         ui = WebUI(self.state, "server")
         result: dict[str, str] = {}
 
         def ask():
+            """Run choose in a worker thread and store its answer."""
             result["value"] = ui.choose("Pick:", ["a", "b"], "a", "nope")
 
         thread = threading.Thread(target=ask)
@@ -134,6 +158,7 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(result.get("value"), "b")
 
     def test_choose_timeout_returns_cancel(self):
+        """An unanswered choose prompt times out and returns cancel."""
         ui = WebUI(self.state, "server")
         with mock.patch("wifile_web.adapter.PROMPT_TIMEOUT", 0.05):
             choice = ui.choose("Action?", ["o", "r", "c", "cancel"], "o", "nope")
@@ -141,6 +166,7 @@ class AdapterTest(unittest.TestCase):
         self.assertIsNone(self.state.get_snapshot()["server"]["prompt"])
 
     def test_ask_text_timeout_raises_eof(self):
+        """An unanswered ask_text prompt times out and raises EOFError."""
         ui = WebUI(self.state, "server")
         with mock.patch("wifile_web.adapter.PROMPT_TIMEOUT", 0.05):
             with self.assertRaises(EOFError):
@@ -148,6 +174,7 @@ class AdapterTest(unittest.TestCase):
         self.assertIsNone(self.state.get_snapshot()["server"]["prompt"])
 
     def test_progress_final_update_persists(self):
+        """A final progress update is persisted with 100 percent."""
         ui = WebUI(self.state, "server")
         ui.progress(2048, 2048, start_time=time.time())
         progress = self.state.get_snapshot()["server"]["progress"]
@@ -155,6 +182,7 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(progress["percent"], 100.0)
 
     def test_progress_is_throttled_between_updates(self):
+        """Rapid progress updates are throttled to the first value."""
         ui = WebUI(self.state, "server")
         ui.progress(1024, 4096, start_time=time.time())
         ui.progress(2048, 4096, start_time=time.time())  # too soon: dropped
@@ -163,7 +191,10 @@ class AdapterTest(unittest.TestCase):
 
 
 class UploadTest(unittest.TestCase):
+    """Tests for multipart upload parsing."""
+
     def _multipart(self, boundary: str, name: str, content: bytes) -> bytes:
+        """Build a single-file multipart body for testing."""
         return (
             (
                 f"--{boundary}\r\n"
@@ -175,6 +206,7 @@ class UploadTest(unittest.TestCase):
         )
 
     def test_multipart_roundtrip_with_subfolder(self):
+        """Uploaded files land in subfolders relative to the batch dir."""
         boundary = "wifileboundary"
         body = self._multipart(boundary, "sub/note.txt", b"uploaded content")
         batch_dir, count = parse_upload(
@@ -190,6 +222,7 @@ class UploadTest(unittest.TestCase):
             shutil.rmtree(batch_dir, ignore_errors=True)
 
     def test_path_traversal_is_sanitized(self):
+        """Traversal names in uploads are stripped to a safe filename."""
         boundary = "wifileboundary"
         body = self._multipart(boundary, "../../evil.txt", b"x")
         batch_dir, count = parse_upload(
@@ -208,12 +241,37 @@ class UploadTest(unittest.TestCase):
             shutil.rmtree(batch_dir, ignore_errors=True)
 
     def test_non_multipart_is_rejected(self):
+        """Non-multipart content is rejected with a ValueError."""
         with self.assertRaises(ValueError):
             parse_upload(b"raw", "text/plain")
 
 
+class NetInfoTest(unittest.TestCase):
+    """Tests for LAN address detection."""
+
+    def test_get_net_addresses_returns_at_least_one_ipv4(self):
+        """get_net_addresses always returns a usable IPv4 address."""
+        addresses = get_net_addresses()
+        self.assertIsInstance(addresses, list)
+        self.assertTrue(addresses)
+        for ip in addresses:
+            self.assertRegex(ip, r"^\d+\.\d+\.\d+\.\d+$")
+
+    def test_looks_virtual_filters_known_ranges(self):
+        """The heuristic drops link-local and 172.16/12 virtual ranges."""
+        self.assertTrue(_looks_virtual("169.254.1.1"))
+        self.assertTrue(_looks_virtual("172.17.0.1"))
+        self.assertTrue(_looks_virtual("172.30.16.1"))
+        self.assertFalse(_looks_virtual("192.168.7.123"))
+        self.assertFalse(_looks_virtual("10.0.0.5"))
+        self.assertFalse(_looks_virtual("127.0.0.1"))
+
+
 class ServerApiTest(unittest.TestCase):
+    """End-to-end tests over a real loopback HTTP server."""
+
     def setUp(self):
+        """Start a loopback HTTP server and its serving thread."""
         self.httpd = create_server("127.0.0.1", 0)
         self.port = self.httpd.server_address[1]
         self.state = self.httpd.web_state
@@ -221,6 +279,7 @@ class ServerApiTest(unittest.TestCase):
         self.thread.start()
 
     def tearDown(self):
+        """Shut down the HTTP server and join the serving thread."""
         self.httpd.shutdown()
         self.httpd.server_close()
         self.thread.join(5)
@@ -228,6 +287,7 @@ class ServerApiTest(unittest.TestCase):
     # -- helpers -------------------------------------------------------------
 
     def _request(self, method, path, body=None, headers=None):
+        """Send an HTTP request and return (status, headers, body)."""
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         try:
             conn.request(method, path, body=body, headers=headers or {})
@@ -237,11 +297,13 @@ class ServerApiTest(unittest.TestCase):
             conn.close()
 
     def _post_json(self, path, payload):
+        """POST a JSON payload and return (status, headers, body)."""
         return self._request(
             "POST", path, json.dumps(payload), {"Content-Type": "application/json"}
         )
 
     def _wait_for(self, predicate, timeout=5.0):
+        """Poll the state snapshot until predicate matches or timeout."""
         deadline = time.time() + timeout
         last = None
         while time.time() < deadline:
@@ -254,6 +316,7 @@ class ServerApiTest(unittest.TestCase):
     # -- tests -----------------------------------------------------------------
 
     def test_state_endpoint_shape(self):
+        """GET /api/state returns the full snapshot shape."""
         status, _, raw = self._request("GET", "/api/state")
         self.assertEqual(status, 200)
         data = json.loads(raw)
@@ -263,23 +326,36 @@ class ServerApiTest(unittest.TestCase):
             for field in ("running", "progress", "prompt", "log"):
                 self.assertIn(field, slot)
 
+    def test_netinfo_endpoint(self):
+        """GET /api/netinfo returns the machine's LAN addresses."""
+        status, _, raw = self._request("GET", "/api/netinfo")
+        self.assertEqual(status, 200)
+        data = json.loads(raw)
+        addresses = data.get("addresses")
+        self.assertIsInstance(addresses, list)
+        self.assertTrue(addresses)
+
     def test_index_is_served(self):
+        """GET / serves the HTML index page."""
         status, headers, raw = self._request("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn("text/html", headers.get("Content-Type", ""))
         self.assertIn(b"WiFile", raw)
 
     def test_start_requires_valid_mode(self):
+        """Starting with an unknown mode returns 400."""
         status, _, _ = self._post_json("/api/start", {"mode": "bogus"})
         self.assertEqual(status, 400)
 
     def test_start_server_requires_source(self):
+        """Starting a server without a source returns 400."""
         status, _, _ = self._post_json(
             "/api/start", {"mode": "server", "port": free_port()}
         )
         self.assertEqual(status, 400)
 
     def test_start_server_rejects_nonexistent_source(self):
+        """Starting a server with a missing source returns 400."""
         status, _, raw = self._post_json(
             "/api/start",
             {"mode": "server", "port": free_port(), "source": "/nonexistent/xyz"},
@@ -288,10 +364,12 @@ class ServerApiTest(unittest.TestCase):
         self.assertIn(b"does not exist", raw)
 
     def test_start_client_requires_host(self):
+        """Starting a client without a host returns 400."""
         status, _, _ = self._post_json("/api/start", {"mode": "client"})
         self.assertEqual(status, 400)
 
     def test_client_prompt_answer_flow(self):
+        """A client run surfaces a prompt that can be answered via the API."""
         with tempfile.TemporaryDirectory() as tmp:
             status, _, _ = self._post_json(
                 "/api/start",
@@ -322,6 +400,7 @@ class ServerApiTest(unittest.TestCase):
             )
 
     def test_double_start_is_rejected(self):
+        """Starting twice while already running returns 409."""
         with tempfile.TemporaryDirectory() as tmp:
             payload = {
                 "mode": "client",
@@ -337,6 +416,7 @@ class ServerApiTest(unittest.TestCase):
             self._wait_for(lambda s: not s["client"]["running"])
 
     def test_upload_endpoint_roundtrip(self):
+        """POST /api/upload stores files and returns their source dir."""
         boundary = "wifileboundary"
         body = (
             f"--{boundary}\r\n"
@@ -359,6 +439,7 @@ class ServerApiTest(unittest.TestCase):
             self.assertEqual(f.read(), "uploaded content")
 
     def test_loopback_transfer_end_to_end(self):
+        """A full server/client transfer works over the loopback interface."""
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "hello.txt")
             with open(src, "w", encoding="utf-8") as f:
@@ -403,6 +484,7 @@ class ServerApiTest(unittest.TestCase):
             self._wait_for(lambda s: not s["server"]["running"])
 
     def test_sse_streams_snapshot(self):
+        """GET /api/events streams snapshot JSON over SSE."""
         sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
         try:
             sock.sendall(
@@ -438,6 +520,7 @@ class WebUiEntryTest(unittest.TestCase):
     """webui.py port handling: falling back when a port is taken."""
 
     def test_bind_server_uses_ephemeral_port(self):
+        """bind_server with port 0 picks an ephemeral port without error."""
         server, error = bind_server("127.0.0.1", 0)
         try:
             self.assertIsNone(error)
@@ -446,6 +529,7 @@ class WebUiEntryTest(unittest.TestCase):
             server.server_close()
 
     def test_bind_server_falls_back_when_port_taken(self):
+        """bind_server falls back when the requested port is already taken."""
         blocker = socket.socket()
         blocker.bind(("127.0.0.1", 0))
         blocker.listen(1)
