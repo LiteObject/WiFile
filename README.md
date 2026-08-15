@@ -306,35 +306,6 @@ If the requested port is unavailable (common on Windows, where some ports
 are reserved by the system), WiFile automatically falls back to a free port
 and prints the actual address.
 
-### Docker
-
-The web UI is pure standard library, so it runs in a tiny container. A
-`Dockerfile` and `docker-compose.yml` are included:
-
-```bash
-docker build -t wifile .
-docker run -d -p 8765:8765 -p 12345:12345 -p 54321:54321/udp -v C:\path\to\files:/data wifile
-# or: docker compose up -d
-```
-
-Notes:
-
-- **Publish both ports** — 8765 for the UI and 12345 (or your custom
-  transfer port) for sending. Publish `54321/udp` too if you want network
-  discovery to work.
-- **Discovery in Docker is limited** — UDP broadcasts stay inside the
-  container's bridge network, so a containerized UI sees the host's senders
-  only while beacons are forwarded (not typical). Peer discovery works best
-  between non-containerized web UIs on the same Wi-Fi.
-- **If 8765 is blocked on the host** (Windows port reservations), change the
-  left side of the compose mapping to another port, e.g. `8876:8765`, and
-  open `http://127.0.0.1:8876`.
-- **Mount the folders** you want to send or receive with `-v`.
-- **Peers use the host's LAN IP**, not the address the UI prints (that is
-  the container's internal address).
-- Inside the container the UI binds to `0.0.0.0` on a fixed port, as
-  described above.
-
 > ⚠️ The web UI binds to localhost by default. With `--host 0.0.0.0`, anyone
 > who can reach the page can make this machine send arbitrary local files —
 > there is no authentication. Only expose it on trusted networks.
