@@ -10,7 +10,6 @@ shared :class:`WebState` store. Endpoints:
     POST /api/start   start the server or client engine thread
     POST /api/upload  multipart upload of files to serve
     POST /api/answer  answer a pending prompt
-    POST /api/settings  toggle discovery (broadcast/listen)
     POST /api/stop    stop an engine thread
 """
 
@@ -31,7 +30,6 @@ from typing import Any
 import wifile
 
 from .adapter import WebUI
-from .discovery import Discovery, ready_label
 from .state import WebState
 
 WEB_PORT = 8765
@@ -58,38 +56,11 @@ class _RequestError(Exception):
         self.message = message
 
 
-def _source_label(source: str) -> str:
-    """Short label for discovery beacons."""
-    if os.path.normcase(source).startswith(os.path.normcase(_UPLOAD_ROOT)):
-        return "browser upload"
-    return os.path.basename(source.rstrip("/\\")) or source
-
-
-class _ServerUI(WebUI):
-    """WebUI that also keeps the discovery beacon's source label fresh."""
-
-    def __init__(
-        self, state: WebState, mode: str, discovery: Discovery, from_upload: bool
-    ) -> None:
-        super().__init__(state, mode)
-        self._discovery = discovery
-        self._from_upload = from_upload
-
-    def message(self, text: str) -> None:
-        super().message(text)
-        if self._from_upload:
-            return
-        label = ready_label(text)
-        if label:
-            self._discovery.update_source(label)
-
-
 class EngineRunner:
     """Starts/stops the sender and receiver engine threads."""
 
-    def __init__(self, state: WebState, discovery: Discovery) -> None:
+    def __init__(self, state: WebState) -> None:
         self._state = state
-        self._discovery = discovery
         self._threads: dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
         self._upload_batches: set[str] = set()
@@ -128,20 +99,12 @@ class EngineRunner:
                 raise ValueError(f"source does not exist: {source!r}")
             self._state.set_running(mode, True)
             self._state.log(mode, f"Starting sender on port {port} for '{source}'")
-            ui = _ServerUI(
-                self._state,
-                mode,
-                self._discovery,
-                from_upload=os.path.normcase(source).startswith(
-                    os.path.normcase(_UPLOAD_ROOT)
-                ),
+            wifile.start_server(
+                port, filepath=filepath, folder=folder, ui=WebUI(self._state, mode)
             )
-            self._discovery.configure_announce(port, _source_label(source))
-            wifile.start_server(port, filepath=filepath, folder=folder, ui=ui)
         except (OSError, ValueError) as e:
             self._state.log(mode, f"Sender failed to start: {e}")
         finally:
-            self._discovery.stop_announcing()
             self._state.set_running(mode, False)
             self._state.clear_progress(mode)
             self._cleanup_uploads()
@@ -228,28 +191,11 @@ class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(
-        self,
-        address: tuple[str, int],
-        state: WebState,
-        runner: EngineRunner,
-        discovery: Discovery,
+        self, address: tuple[str, int], state: WebState, runner: EngineRunner
     ) -> None:
         self.web_state = state
         self.runner = runner
-        self.discovery = discovery
         super().__init__(address, _Handler)
-        # Advertise the web UI port only when it is reachable from the LAN.
-        host = self.server_address[0]
-        if host in ("127.0.0.1", "localhost", "::1"):
-            self.discovery.set_web_port(None)
-        else:
-            self.discovery.set_web_port(self.server_address[1])
-
-    def server_close(self) -> None:
-        try:
-            self.discovery.stop()
-        finally:
-            super().server_close()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -264,10 +210,6 @@ class _Handler(BaseHTTPRequestHandler):
     @property
     def runner(self) -> EngineRunner:
         return self.server.runner  # type: ignore[attr-defined]
-
-    @property
-    def discovery(self) -> Discovery:
-        return self.server.discovery  # type: ignore[attr-defined]
 
     def log_message(self, *args: Any) -> None:
         pass  # keep the console quiet; state changes go to the UI instead
@@ -338,8 +280,6 @@ class _Handler(BaseHTTPRequestHandler):
                 self._handle_stop()
             elif path == "/api/answer":
                 self._handle_answer()
-            elif path == "/api/settings":
-                self._handle_settings()
             elif path == "/api/upload":
                 self._handle_upload()
             else:
@@ -415,28 +355,6 @@ class _Handler(BaseHTTPRequestHandler):
             raise _RequestError(409, "no pending prompt with that id")
         self._send_json(200, {"ok": True})
 
-    def _handle_settings(self) -> None:
-        data = self._read_json()
-        updates: dict[str, bool] = {}
-        for key in ("broadcast", "listen"):
-            if key in data:
-                if not isinstance(data[key], bool):
-                    raise _RequestError(400, f"'{key}' must be a boolean")
-                updates[key] = data[key]
-        if not updates:
-            raise _RequestError(400, "no settings provided")
-        self.state.set_settings(updates)
-        if "listen" in updates:
-            if updates["listen"]:
-                self.discovery.start_listener()
-            else:
-                self.discovery.stop_listener()
-        if "broadcast" in updates:
-            self.discovery.set_broadcast_enabled(updates["broadcast"])
-        self._send_json(
-            200, {"ok": True, "settings": self.state.get_snapshot()["settings"]}
-        )
-
     def _handle_upload(self) -> None:
         raw_length = self.headers.get("Content-Length")
         try:
@@ -510,6 +428,5 @@ def create_server(host: str = "127.0.0.1", port: int = WEB_PORT) -> _Server:
     """Create (and bind) the web server; call ``serve_forever()`` on it."""
     _sweep_uploads()
     state = WebState()
-    discovery = Discovery(state)
-    runner = EngineRunner(state, discovery)
-    return _Server((host, port), state, runner, discovery)
+    runner = EngineRunner(state)
+    return _Server((host, port), state, runner)

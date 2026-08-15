@@ -48,14 +48,6 @@
                 <button type="button" class="btn danger" id="server-stop" disabled>Stop</button>
             </div>
 
-            <label class="switch-row">
-                <input type="checkbox" id="server-broadcast">
-                <span class="switch"></span>
-                <span>Broadcast so receivers can find you</span>
-            </label>
-            <div class="switch-hint" id="server-broadcast-hint" hidden>Receivers
-                won't see this sender in their list until broadcasting is on.</div>
-
             <div class="status" id="server-status">Idle</div>
             <div class="progress">
                 <div class="bar" id="server-bar"></div>
@@ -97,20 +89,6 @@
                 <label><input type="radio" name="conflict" value="overwrite"> Overwrite</label>
                 <label><input type="radio" name="conflict" value="rename"> Auto-rename</label>
             </fieldset>
-
-            <div class="peers">
-                <div class="peers-head">Senders on this network
-                    <span class="peers-count" id="peers-count">off</span>
-                </div>
-                <label class="switch-row">
-                    <input type="checkbox" id="client-listen">
-                    <span class="switch"></span>
-                    <span>Listen for senders</span>
-                </label>
-                <ul class="peer-list" id="peer-list" hidden></ul>
-                <div class="peers-empty" id="peers-empty">Turn on "Listen for
-                    senders" to discover WiFile senders on this network.</div>
-            </div>
 
             <div class="actions">
                 <button type="button" class="btn primary" id="client-start">Start receiving</button>

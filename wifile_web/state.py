@@ -2,10 +2,9 @@
 
 The store keeps one slot per mode ("server" for sending, "client" for
 receiving). Each slot holds a bounded log, the current progress summary, an
-optional pending prompt, and the running/stop flags. It also holds the list
-of senders discovered on the network (see ``wifile_web.discovery``). Every
-mutation bumps a version counter and notifies waiters, which is what the SSE
-endpoint uses to push changes to the browser.
+optional pending prompt, and the running/stop flags. Every mutation bumps a
+version counter and notifies waiters, which is what the SSE endpoint uses to
+push changes to the browser.
 """
 
 from __future__ import annotations
@@ -56,8 +55,6 @@ class WebState:
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._slots: dict[str, _Slot] = {mode: _Slot(max_log_lines) for mode in MODES}
-        self._peers: list[dict[str, Any]] = []
-        self._settings: dict[str, bool] = {"broadcast": False, "listen": False}
         self._version = 0
         self._prompt_counter = 0
 
@@ -202,25 +199,6 @@ class WebState:
         with self._lock:
             return self._slots[mode].running
 
-    def set_peers(self, peers: list[dict[str, Any]]) -> None:
-        """Replace the discovered peers; bumps only when the list changed."""
-        with self._lock:
-            if peers == self._peers:
-                return
-            self._peers = [dict(p) for p in peers]
-            self._bump()
-
-    def set_settings(self, updates: dict[str, bool]) -> None:
-        """Apply discovery settings (the broadcast/listen toggles)."""
-        with self._lock:
-            changed = False
-            for key, value in updates.items():
-                if key in self._settings and self._settings[key] != bool(value):
-                    self._settings[key] = bool(value)
-                    changed = True
-            if changed:
-                self._bump()
-
     def get_snapshot(self) -> dict[str, Any]:
         """JSON-ready picture of both slots plus the current version."""
         with self._lock:
@@ -228,8 +206,6 @@ class WebState:
                 "version": self._version,
                 "server": self._slot_snapshot("server"),
                 "client": self._slot_snapshot("client"),
-                "peers": [dict(p) for p in self._peers],
-                "settings": dict(self._settings),
             }
 
     def _slot_snapshot(self, mode: str) -> dict[str, Any]:

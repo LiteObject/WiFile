@@ -20,21 +20,12 @@ from unittest import mock
 import wifile
 from webui import bind_server
 from wifile_web.adapter import WebUI
-from wifile_web.discovery import Discovery, ready_label
 from wifile_web.server import create_server, parse_upload
 from wifile_web.state import WebState
 
 
 def free_port() -> int:
     sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = sock.getsockname()[1]
-    sock.close()
-    return port
-
-
-def free_udp_port() -> int:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
     sock.close()
@@ -221,178 +212,6 @@ class UploadTest(unittest.TestCase):
             parse_upload(b"raw", "text/plain")
 
 
-class DiscoveryTest(unittest.TestCase):
-    """UDP discovery: beacons, peer lists, goodbye, expiry, self-filter."""
-
-    def test_ready_label_parses_engine_messages(self):
-        self.assertEqual(ready_label("Ready to send 'report.pdf'"), "report.pdf")
-        self.assertEqual(
-            ready_label("Ready to send 3 file(s) from 'C:\\photos' (one by one)"),
-            "3 file(s) from 'C:\\photos'",
-        )
-        self.assertIsNone(ready_label("Server listening on port 12345"))
-
-    def test_beacon_appears_in_receiver_state_and_goodbye_clears(self):
-        port = free_udp_port()
-        recv_state = WebState()
-        receiver = Discovery(recv_state, port=port)
-        sender = Discovery(WebState(), port=port)
-        try:
-            self.assertTrue(receiver.start_listener())
-            sender.start_announcing(12345, "report.pdf", target="127.0.0.1")
-            deadline = time.time() + 3
-            peers: list[dict] = []
-            while time.time() < deadline:
-                peers = recv_state.get_snapshot()["peers"]
-                if peers:
-                    break
-                time.sleep(0.05)
-            self.assertEqual(len(peers), 1)
-            self.assertEqual(peers[0]["host"], "127.0.0.1")
-            self.assertEqual(peers[0]["port"], 12345)
-            self.assertEqual(peers[0]["source"], "report.pdf")
-            self.assertNotEqual(peers[0]["id"], "")
-
-            sender.stop_announcing()  # sends a goodbye packet
-            deadline = time.time() + 3
-            while time.time() < deadline:
-                if not recv_state.get_snapshot()["peers"]:
-                    break
-                time.sleep(0.05)
-            self.assertEqual(recv_state.get_snapshot()["peers"], [])
-        finally:
-            sender.stop()
-            receiver.stop()
-
-    def test_own_beacon_is_ignored(self):
-        state = WebState()
-        discovery = Discovery(state, port=free_udp_port(), announce_interval=0.05)
-        try:
-            self.assertTrue(discovery.start_listener())
-            discovery.start_announcing(12345, "x", target="127.0.0.1")
-            time.sleep(0.3)
-            self.assertEqual(state.get_snapshot()["peers"], [])
-        finally:
-            discovery.stop()
-
-    def test_malformed_and_foreign_packets_are_ignored(self):
-        port = free_udp_port()
-        state = WebState()
-        discovery = Discovery(state, port=port)
-        try:
-            self.assertTrue(discovery.start_listener())
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
-                sock.sendto(b"not json", ("127.0.0.1", port))
-                sock.sendto(
-                    json.dumps({"app": "other", "id": "x"}).encode(),
-                    ("127.0.0.1", port),
-                )
-                sock.sendto(
-                    json.dumps({"app": "wifile", "id": "x", "port": "abc"}).encode(),
-                    ("127.0.0.1", port),
-                )
-            finally:
-                sock.close()
-            time.sleep(0.3)
-            self.assertEqual(state.get_snapshot()["peers"], [])
-        finally:
-            discovery.stop()
-
-    def test_peer_expires_after_ttl(self):
-        port = free_udp_port()
-        state = WebState()
-        discovery = Discovery(state, port=port, peer_ttl=0.3)
-        try:
-            self.assertTrue(discovery.start_listener())
-            beacon = json.dumps(
-                {
-                    "app": "wifile",
-                    "v": 1,
-                    "id": "testpeer",
-                    "name": "test-peer",
-                    "platform": "test",
-                    "port": 12345,
-                    "source": "x.bin",
-                }
-            ).encode()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.sendto(beacon, ("127.0.0.1", port))
-            sock.close()
-            deadline = time.time() + 3
-            while time.time() < deadline and not state.get_snapshot()["peers"]:
-                time.sleep(0.05)
-            self.assertEqual(len(state.get_snapshot()["peers"]), 1)
-            deadline = time.time() + 3
-            while time.time() < deadline and state.get_snapshot()["peers"]:
-                time.sleep(0.05)
-            self.assertEqual(state.get_snapshot()["peers"], [])
-        finally:
-            discovery.stop()
-
-    def test_configure_announce_respects_broadcast_toggle(self):
-        port = free_udp_port()
-        recv_state = WebState()
-        receiver = Discovery(recv_state, port=port)
-        sender = Discovery(WebState(), port=port, announce_interval=0.05)
-        try:
-            self.assertTrue(receiver.start_listener())
-            # Broadcasting is off by default: configuring must not send beacons.
-            sender.configure_announce(12345, "x.bin", target="127.0.0.1")
-            time.sleep(0.4)
-            self.assertEqual(recv_state.get_snapshot()["peers"], [])
-
-            sender.set_broadcast_enabled(True)
-            deadline = time.time() + 3
-            while time.time() < deadline:
-                if recv_state.get_snapshot()["peers"]:
-                    break
-                time.sleep(0.05)
-            self.assertEqual(len(recv_state.get_snapshot()["peers"]), 1)
-
-            sender.set_broadcast_enabled(False)  # sends a goodbye packet
-            deadline = time.time() + 3
-            while time.time() < deadline:
-                if not recv_state.get_snapshot()["peers"]:
-                    break
-                time.sleep(0.05)
-            self.assertEqual(recv_state.get_snapshot()["peers"], [])
-        finally:
-            sender.stop()
-            receiver.stop()
-
-    def test_stop_listener_clears_peers(self):
-        port = free_udp_port()
-        state = WebState()
-        discovery = Discovery(state, port=port)
-        try:
-            self.assertTrue(discovery.start_listener())
-            beacon = json.dumps(
-                {
-                    "app": "wifile",
-                    "v": 1,
-                    "id": "peer-x",
-                    "name": "peer-x",
-                    "platform": "test",
-                    "port": 12345,
-                    "source": "x.bin",
-                }
-            ).encode()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.sendto(beacon, ("127.0.0.1", port))
-            sock.close()
-            deadline = time.time() + 3
-            while time.time() < deadline and not state.get_snapshot()["peers"]:
-                time.sleep(0.05)
-            self.assertEqual(len(state.get_snapshot()["peers"]), 1)
-
-            discovery.stop_listener()
-            self.assertFalse(discovery.is_listening())
-            self.assertEqual(state.get_snapshot()["peers"], [])
-        finally:
-            discovery.stop()
-
-
 class ServerApiTest(unittest.TestCase):
     def setUp(self):
         self.httpd = create_server("127.0.0.1", 0)
@@ -439,10 +258,6 @@ class ServerApiTest(unittest.TestCase):
         self.assertEqual(status, 200)
         data = json.loads(raw)
         self.assertIn("version", data)
-        self.assertIn("peers", data)
-        self.assertEqual(data["peers"], [])
-        self.assertIn("settings", data)
-        self.assertEqual(data["settings"], {"broadcast": False, "listen": False})
         for key in ("server", "client"):
             slot = data[key]
             for field in ("running", "progress", "prompt", "log"):
@@ -542,32 +357,6 @@ class ServerApiTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(path))
         with open(path, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), "uploaded content")
-
-    def test_settings_toggle_listen_and_broadcast(self):
-        status, _, raw = self._post_json("/api/settings", {"listen": True})
-        self.assertEqual(status, 200)
-        data = json.loads(raw)
-        self.assertTrue(data["settings"]["listen"])
-        self.assertTrue(self.httpd.discovery.is_listening())
-
-        status, _, _ = self._post_json("/api/settings", {"broadcast": True})
-        self.assertEqual(status, 200)
-        snap = self._wait_for(lambda s: s["settings"]["broadcast"])
-        self.assertTrue(snap["settings"]["broadcast"])
-
-        status, _, _ = self._post_json("/api/settings", {"listen": False})
-        self.assertEqual(status, 200)
-        self.assertFalse(self.httpd.discovery.is_listening())
-        snap = self._wait_for(lambda s: not s["settings"]["listen"])
-        self.assertTrue(snap["settings"]["broadcast"], "broadcast unchanged")
-
-    def test_settings_rejects_invalid_values(self):
-        status, _, _ = self._post_json("/api/settings", {"listen": "yes"})
-        self.assertEqual(status, 400)
-        status, _, _ = self._post_json("/api/settings", {})
-        self.assertEqual(status, 400)
-        status, _, _ = self._post_json("/api/settings", {"bogus": True})
-        self.assertEqual(status, 400)
 
     def test_loopback_transfer_end_to_end(self):
         with tempfile.TemporaryDirectory() as tmp:
