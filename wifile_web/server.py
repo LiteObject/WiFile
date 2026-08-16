@@ -461,9 +461,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- routing ------------------------------------------------------------------
 
-    def do_GET(
+    def do_GET(  # noqa: N802 (http.server API)  # pylint: disable=invalid-name
         self,
-    ) -> None:  # noqa: N802 (http.server API)  # pylint: disable=invalid-name
+    ) -> None:
         """Route GET requests to the API, events stream, or static files."""
         try:
             path = self.path.split("?", 1)[0]
